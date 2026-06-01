@@ -1,0 +1,36 @@
+# 图片
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+
+# 模型 & 权重 & 大文件
+*.bin
+*.pth
+*.pt
+*.pkl
+*.ckpt
+*.h5
+*.hdf5
+*.onnx
+*.model
+*.tar
+*.zip
+*.rar
+*.gz
+*.7z
+*.bz2
+
+# 缓存 & 数据集 & 输出
+huggingface_cache/
+results/
+checkpoints/
+models/
+pretrained/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
