@@ -1,0 +1,205 @@
+animals:
+- concept_token: phoenix
+  settings:
+  - rising from a fiery ashes
+  - soaring through a glowing sky
+  - perching on a mountain peak
+  - singing a haunting melody
+  - igniting flames with its wings
+  style: A fiery and majestic illustration of
+  subject: 1.5m wingspan phoenix, bright orange feathers, golden talons, upright crest
+- concept_token: zebra
+  settings:
+  - grazing alongside a river
+  - running in a herd across the plains
+  - resting under the shade of an acacia tree
+  - crossing a dusty path in the wild
+  - protecting its young in the savannah
+  style: A vibrant and striking portrait of
+  subject: 1.4m shoulder height zebra, 1.2cm wide black-white vertical stripes, short mane
+- concept_token: cheetah
+  settings:
+  - sprinting across the savannah
+  - stalking a gazelle in the grass
+  - relaxing in the shade under a tree
+  - marking territory with its scent
+  - napping after a successful hunt
+  style: A sleek and fast depiction of
+  subject: Sharp amber eyes cheetah, golden coat, 1cm round black spots, facial tear marks
+- concept_token: walrus
+  settings:
+  - lounging on an ice floe
+  - diving for clams in the sea
+  - bellowing from the shore
+  - resting near a snowy coastline
+  - swimming gracefully in the ocean
+  style: A massive and majestic depiction of
+  subject: 3.5m long walrus, 80cm ivory tusks, brownish-gray skin, 15cm prominent whiskers
+- concept_token: zebra
+  settings:
+  - grazing under the sun in the savannah
+  - running with a herd through the grasslands
+  - standing near a watering hole
+  - crossing a river in the wild
+  - trotting beside a wildebeest
+  style: A bold and striking illustration of
+  subject: 1.5m shoulder height zebra, 1.3cm wide black-white stripes, tufted tail tip
+- concept_token: cheetah
+  settings:
+  - sprinting at top speed in the savannah
+  - resting in the shade of a tree
+  - hunting a gazelle in tall grass
+  - stretching before a sprint
+  - watching the horizon from a hill
+  style: A sleek and fast portrayal of
+  subject: 90cm shoulder height cheetah, 1.2cm oval black spots, 80cm long tail
+- concept_token: gorilla
+  settings:
+  - sitting in a jungle clearing
+  - playing with a baby gorilla
+  - searching for fruit in the trees
+  - relaxing by a waterfall
+  - beating its chest to assert dominance
+  style: A strong and wise illustration of
+  subject: 1.7m tall male gorilla, dark brown fur, broad chest, silverback patch
+- concept_token: dog
+  settings:
+  - chasing a frisbee
+  - dressed in a raincoat
+  - in a city alley
+  - jumping over a puddle
+  - at a veterinarian's office
+  - playing in a park
+  - sleeping on a couch
+  - running on a beach
+  style: A hyper-realistic digital painting of
+  subject: 60cm shoulder height golden retriever, wavy golden fur, brown eyes, black nose
+- concept_token: parrot
+  settings:
+  - in a tropical rainforest
+  - singing a song
+  - on the water
+  - sitting on a rock
+  - in a rain storm
+  - perched on a branch
+  - eating fruit
+  style: A watercolor illustration of
+  subject: 85cm Scarlet macaw, red body, yellow wing patches, blue wingtips, curved black beak
+- concept_token: dog
+  settings:
+  - wearing a bandana
+  - on a beach
+  - in a city alley
+  - in a snowy backyard
+  - at a veterinarian's office
+  - playing with a toy
+  - barking at a squirrel
+  style: A 3D animation of
+  subject: 55cm shoulder height border collie, black-white coat, yellow collar with silver buckle
+- concept_token: fox
+  settings:
+  - wearing a scarf
+  - dressed in a warm coat
+  - wearing a playful bow
+  - resting in a den
+  - near a campsite
+  - exploring a forest
+  - looking at the stars
+  style: A hyper-realistic digital painting of
+  subject: 50cm shoulder height red fox, red back, white belly, 40cm bushy tail with white tip
+- concept_token: puppy
+  settings:
+  - in a pet store
+  - eating his food
+  - wearing a training harness
+  - dressed in a bandana
+  - at a lake
+  - playing with a ball
+  - sleeping in a bed
+  style: A 3D animation of
+  subject: 30cm shoulder height 8-week-old Labrador puppy, glossy chocolate brown coat, black nose
+- concept_token: dog
+  settings:
+  - wearing a bandana
+  - biting a bone
+  - wearing a birthday hat
+  - in a snowy backyard
+  - sitting by a fireplace
+  style: A 3D animation of
+  subject: 55cm shoulder height border collie, 60% black-40% white coat, yellow collar with silver tag
+- concept_token: kitten
+  settings:
+  - in a garden
+  - dressed in a cute sweater
+  - wearing a collar with a bell
+  - dressed in a superhero cape
+  - running through a field
+  - playing with a toy
+  - sitting in a basket
+  style: A watercolor illustration of
+  subject: 15cm tall 12-week-old kitten, sleek cream fur, striking blue eyes, pink nose
+- concept_token: puppy
+  settings:
+  - in a pet store
+  - in a grassy yard
+  - wearing a training harness
+  - dressed in a bandana
+  - wearing a life vest
+  style: ''
+  subject: 25cm shoulder height 10-week-old golden retriever puppy, light golden fur, floppy ears
+- concept_token: puppy
+  settings:
+  - wearing a small sweater
+  - digging a hole
+  - wearing a training harness
+  - sticking head out of the car window
+  - swimming
+  - playing in the yard
+  - chasing a ball
+  style: A watercolor illustration of
+  subject: 28cm shoulder height 9-week-old beagle puppy, tri-color (white-black-tan) coat, long ears
+- concept_token: cat
+  settings:
+  - playing with a yarn ball
+  - sleeping in a box
+  - wearing a fluffy collar
+  - climbing a tree
+  - sitting on a shelf
+  style: A hyper-realistic digital painting of
+  subject: 30cm tall domestic shorthair cat, gray tabby coat, green eyes, pink paw pads
+- concept_token: cat
+  settings:
+  - wearing a bow tie
+  - dressed in a Halloween costume
+  - in a busy alley
+  - on a sled
+  - wearing a small bell
+  style: A hyper-realistic digital painting of
+  subject: 32cm tall domestic shorthair cat, glossy black coat, yellow eyes, 8cm long whiskers
+- concept_token: kitten
+  settings:
+  - wearing a tiny hat
+  - on a couch
+  - in a hospital
+  - playing with a feather toy
+  - on a rooftop
+  style: ''
+  subject: 14cm tall 10-week-old kitten, sleek cream fur, striking blue eyes, pink ears
+- concept_token: hedgehog
+  settings:
+  - in a cozy nest
+  - dressed in a miniature jacket
+  - wearing a small collar
+  - dressed in a festive outfit
+  - wearing a flower crown
+  style: A 3D animation of
+  subject: 15cm long hedgehog, brown 3cm spines, pink nose, black eyes
+- concept_token: horse
+  settings:
+  - in a stable
+  - jumping over a hurdle
+  - in a snowy field
+  - in a mountain trail
+  - in a busy street
+  style: A hyper-realistic digital painting of
+  subject: 1.6m shoulder height Palomino horse, golden coat, 80cm white flowing mane/tail, black hooves

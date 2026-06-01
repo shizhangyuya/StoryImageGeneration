@@ -1,0 +1,37 @@
+{
+    "combinations": [
+        {
+            "id_prompt": "A heroic fantasy illustration of a young elf archer",
+            "frame_prompt_list": [
+                "defending a glowing forest spring",
+                "tracking a silver stag at dawn",
+                "confronting a shadowy wolf pack",
+                "climbing a misty mountain peak",
+                "aiding a wounded traveler",
+                "guarding an ancient runestone"
+            ]
+        },
+        {
+            "id_prompt": "A steampunk-style poster of a female inventor with her mechanical companion",
+            "frame_prompt_list": [
+                "tinkering in a cluttered workshop",
+                "flying over a Victorian cityscape",
+                "presenting an invention at a grand exhibition",
+                "repairing a steam-powered airship",
+                "exploring a forgotten underground ruin",
+                "battling a rogue automaton"
+            ]
+        },
+        {
+            "id_prompt": "A cozy watercolor painting of a little witch with her black cat",
+            "frame_prompt_list": [
+                "brewing tea in a cottage garden",
+                "collecting starflower petals at dusk",
+                "reading a spellbook by the fireplace",
+                "flying over a sleepy village on a broomstick",
+                "planting magical herbs in a window box",
+                "helping a lost firefly find its way"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,37 @@
+{
+    "combinations": [
+        {
+            "id_prompt": "A photo of a happy hedgehog and cheese",
+            "frame_prompt_list": [
+                "hedgehog nuzzles its cheese while curled amid blooming spring flowers",
+                "hedgehog tucks its cheese beside a sparkling stream and laps at the water",
+                "hedgehog peeks from a cozy burrow, clutching its cheese in tiny paws",
+                "hedgehog carries its cheese through an autumn forest, leaves sticking to its quills",
+                "hedgehog nibbles a tiny cheese wheel while perched on a mossy stone",
+                "hedgehog balances its cheese on a spotted mushroom and tilts its head playfully"
+            ]
+        },
+        {
+            "id_prompt": "A hyper-realistic digital painting of a young ginger boy",
+            "frame_prompt_list": [
+                "dribbles his ball against an old brick wall covered in colorful graffiti",
+                "kicks his ball through a street filled with cars, laughing as it bounces",
+                "chases his ball toward a bustling playground, sandals slapping the pavement",
+                "holds his ball beside a lake, watching its reflection in the early morning light",
+                "sits with his ball against a sunset backdrop, twisting grass between his fingers",
+                "tosses his ball in a quiet meadow, clouds drifting across the sky above"
+            ]
+        },
+        {
+            "id_prompt": "A cinematic portrait of a man and a woman",
+            "frame_prompt_list": [
+                "lean toward each other over mugs in a cozy coffee shop with large windows",
+                "interlace fingers while walking along a sandy beach as the sunset bleeds pink",
+                "brush shoulders on a bustling city street at night, neon glinting off their coats",
+                "lean against each other on a park bench, catching falling leaves mid-conversation",
+                "huddle under an umbrella during soft rain, sharing a quiet smile as they stand",
+                "gesture toward a canvas while talking in a vibrant art gallery surrounded by paintings"
+            ]
+        }
+    ]
+}

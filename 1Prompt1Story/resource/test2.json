@@ -1,0 +1,36 @@
+{
+    "combinations": [
+        {
+            "id_prompt": "A photo of a happy hedgehog with its cheese,",
+            "frame_prompt_list": [
+                "amid blooming spring flowers",
+                "beside a sparkling stream",
+                "peeking from a cozy burrow",
+                "in an autumn forest",
+                "next to a tiny cheese wheel",
+                "sitting on a mushroom"]
+        },
+        {
+            "id_prompt": "A hyper-realistic digital painting of a young ginger boy with his ball",
+            "frame_prompt_list": [
+                "by an old brick wall covered in colorful graffiti",
+                "in the middle of a street filled with cars",
+                "near a bustling playground",
+                "next to a lake reflecting the early morning light",
+                "set against the backdrop of sunset",
+                "standing in a quiet meadow","under a cloudy sky"
+            ]
+        },
+        {
+           "id_prompt": "A cinematic portrait of a man and a woman",
+            "frame_prompt_list": [
+                "in a cozy coffee shop with large windows",
+                "walking along a sandy beach at sunset",
+                "on a bustling city street at night",
+                "on a quiet park bench amidst falling leaves",
+                "under an umbrella during a soft rain",
+                "in a vibrant art gallery surrounded by paintings"
+            ]
+        }
+    ]
+}

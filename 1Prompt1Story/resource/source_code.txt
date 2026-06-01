@@ -1,0 +1,3988 @@
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_ENDPOINT"] = "https://hf-mirror.com"
+import argparse
+import yaml
+from main import generate_images, load_unet_controller
+from unet import utils
+import torch
+import queue
+import threading
+from tqdm import tqdm
+def main_ben(unet_controller, pipe, save_dir, id_prompt, frame_prompt_list, seed, window_length, original_id_prompt=None):
+unet_controller.ipca_index = -1
+unet_controller.ipca_time_step = -1
+if unet_controller is not None:
+unet_controller.reset_first_frame_kv()
+os.makedirs(save_dir, exist_ok=True)
+generation_id_prompt = id_prompt
+images, story_image = generate_images(
+unet_controller, pipe, generation_id_prompt, frame_prompt_list,
+save_dir, window_length, seed, verbose=False
+)
+if original_id_prompt is not None and original_id_prompt != generation_id_prompt:
+prefix_to_replace = f'{generation_id_prompt} '
+for image_file in os.listdir(save_dir):
+if image_file.endswith('.jpg') and not image_file.startswith('story_image'):
+if image_file.startswith(prefix_to_replace):
+frame_part = image_file[len(prefix_to_replace):]
+new_filename = f'{original_id_prompt} {frame_part}'
+old_path = os.path.join(save_dir, image_file)
+new_path = os.path.join(save_dir, new_filename)
+if os.path.exists(old_path) and old_path != new_path:
+os.rename(old_path, new_path)
+return images, story_image
+def process_instance(unet_controller, pipe, instance):
+save_dir, id_prompt, frame_prompt_list, seed, window_length, subject_text, original_id_prompt = instance
+unet_controller.subject_text = subject_text
+return main_ben(unet_controller, pipe, save_dir, id_prompt, frame_prompt_list, seed, window_length, original_id_prompt)
+def worker(device, unet_controller, pipe, task_queue, pbar):
+while not task_queue.empty():
+instance = task_queue.get()
+if instance is None:
+break
+result = process_instance(unet_controller, pipe, instance)
+print(f"Finished processing {instance[1]}")
+task_queue.task_done()
+pbar.update(1)
+def main():
+parser = argparse.ArgumentParser(description="Calculate image similarities using DreamSim or CLIP.")
+parser.add_argument('--device', type=str, choices=['cuda:0', 'cuda:1', 'cuda'], default='cuda')
+parser.add_argument('--save_dir', type=str, default="./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2")
+parser.add_argument('--refined_benchmark_path', type=str, default="resource/consistory+1p1s_allprompt_refined.yaml", help='Path to yaml file containing style, subject, new_subject and settings')
+parser.add_argument('--model_path', type=str, default='stabilityai/stable-diffusion-xl-base-1.0', help='Path to the model')
+parser.add_argument('--precision', type=str, choices=["fp16", "fp32"], default="fp16", help='Model precision')
+parser.add_argument('--window_length', type=int, default=10, help='Window length for story generation')
+parser.add_argument('--num_gpus', type=int, default=2, help='Number of GPUs to use')
+parser.add_argument('--fix_seed', type=int, default=42, help='-1 for random seed')
+parser.add_argument('--use_new_subject', action='store_true', help='Use new_subject for image generation (filename always uses subject)')
+parser.add_argument('--visualize_modulation_scores', action='store_true', help='Enable visualization of modulation scores')
+parser.add_argument('--modulation_vis_positions', type=str, nargs='+', default=['up1'],
+help='UNet positions to visualize (e.g., up1 up0 mid). Options: down0, down1, down2, mid, up0, up1, up2')
+parser.add_argument('--modulation_vis_layer_indices', type=int, nargs='+', default=[2],
+help='Layer indices to visualize (e.g., 0 1 2). 0=first Transformer2DModel, 1=second, 2=third, etc.')
+args = parser.parse_args()
+if torch.cuda.is_available():
+num_available_gpus = torch.cuda.device_count()
+print(f"检测到 {num_available_gpus} 个GPU")
+else:
+num_available_gpus = 0
+print("警告：未检测到CUDA设备，将使用CPU")
+if args.num_gpus == 1:
+if args.device.startswith('cuda') and not torch.cuda.is_available():
+print(f"警告：{args.device} 不可用，将使用 CPU")
+devices = ['cpu']
+else:
+devices = [args.device]
+else:
+if num_available_gpus == 0:
+print("警告：没有可用的GPU，将使用CPU")
+devices = ['cpu']
+else:
+actual_num_gpus = min(args.num_gpus, num_available_gpus)
+if actual_num_gpus < args.num_gpus:
+print(f"警告：请求使用 {args.num_gpus} 个GPU，但只有 {num_available_gpus} 个可用。将使用 {actual_num_gpus} 个GPU。")
+devices = [f'cuda:{i}' for i in range(actual_num_gpus)]
+unet_controllers = {}
+pipes = {}
+for device in devices:
+pipe, _, tokenizer = utils.load_pipe_from_path(args.model_path, device, torch.float16 if args.precision == "fp16" else torch.float32, args.precision)
+unet_controller = load_unet_controller(pipe, device)
+unet_controller.Save_story_image = False
+unet_controller.Prompt_embeds_mode = "single"
+unet_controller.save_self_attention = False
+unet_controller.use_half_precision = True
+unet_controller.max_heads_to_save = 4
+if args.visualize_modulation_scores:
+unet_controller.Visualize_modulation_scores = True
+unet_controller.Modulation_scores_vis_positions = args.modulation_vis_positions
+unet_controller.Modulation_scores_vis_layer_indices = args.modulation_vis_layer_indices
+print(f"启用modulation scores可视化 - 位置: {args.modulation_vis_positions}, 层索引: {args.modulation_vis_layer_indices}")
+unet_controllers[device] = unet_controller
+pipes[device] = pipe
+with open(os.path.expanduser(args.refined_benchmark_path), 'r') as file:
+refined_data = yaml.safe_load(file)
+instances = []
+for subject_domain, subject_domain_instances in refined_data.items():
+for index, refined_instance in enumerate(subject_domain_instances):
+refined_style = refined_instance.get("style", "").strip()
+refined_subject = refined_instance.get("subject", "")
+frame_prompt_list = refined_instance["settings"]
+if args.use_new_subject:
+subject_for_generation = refined_instance.get("new_subject", refined_subject)
+else:
+subject_for_generation = refined_subject
+if refined_style:
+generation_id_prompt = f'{refined_style} {subject_for_generation}'
+else:
+generation_id_prompt = subject_for_generation
+if refined_style:
+filename_id_prompt = f'{refined_style} {refined_subject}'
+else:
+filename_id_prompt = refined_subject
+subject_text = refined_subject
+save_dir = os.path.join(args.save_dir, f"{subject_domain}_{index}")
+if os.path.exists(save_dir):
+try:
+existing_files = os.listdir(save_dir)
+has_images = any(
+fname.lower().endswith(('.jpg', '.jpeg', '.png'))
+for fname in existing_files
+)
+except Exception as e:
+print(f"检查目录 {save_dir} 时出错：{e}，将继续重新生成该实例。")
+has_images = False
+if has_images:
+print(f"检测到目录 {save_dir} 已存在生成图像，跳过该实例。")
+continue
+if args.fix_seed != -1:
+seed = args.fix_seed
+else:
+import random
+seed = random.randint(0, 2**32 - 1)
+instances.append((save_dir, generation_id_prompt, frame_prompt_list, seed, args.window_length, subject_text, filename_id_prompt))
+task_queue = queue.Queue()
+for instance in instances:
+task_queue.put(instance)
+pbar = tqdm(total=len(instances))
+threads = []
+for device in devices:
+unet_controller = unet_controllers[device]
+pipe = pipes[device]
+thread = threading.Thread(target=worker, args=(device, unet_controller, pipe, task_queue, pbar))
+threads.append(thread)
+thread.start()
+import time
+time.sleep(1)
+for thread in threads:
+thread.join()
+pbar.close()
+if __name__ == "__main__":
+main()
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_ENDPOINT"] = "https://hf-mirror.com"
+import torch
+import random
+import diffusers
+import torch.utils
+import unet.utils as utils
+from unet.unet_controller import UNetController
+import argparse
+from datetime import datetime
+diffusers.utils.logging.set_verbosity_error()
+def load_unet_controller(pipe, device):
+unet_controller = UNetController()
+unet_controller.device = device
+unet_controller.tokenizer = pipe.tokenizer
+return unet_controller
+def generate_images(unet_controller: UNetController, pipe, id_prompt, frame_prompt_list, save_dir, window_length, seed, verbose=True):
+generate = torch.Generator().manual_seed(seed)
+if unet_controller is not None:
+unet_controller.id_prompt = id_prompt
+if unet_controller is not None:
+unet_controller.reset_first_frame_kv()
+if unet_controller.Use_ipca is True:
+unet_controller.Store_qkv = True
+original_prompt_embeds_mode = unet_controller.Prompt_embeds_mode
+unet_controller.Prompt_embeds_mode = "original"
+_ = pipe(id_prompt, generator=generate, unet_controller=unet_controller).images
+unet_controller.Prompt_embeds_mode = original_prompt_embeds_mode
+unet_controller.Store_qkv = False
+images, story_image = utils.movement_gen_story_slide_windows(
+id_prompt, frame_prompt_list, pipe, window_length, seed, unet_controller, save_dir, verbose=verbose
+)
+return images, story_image
+def main(device, model_path, save_dir, id_prompt, frame_prompt_list, precision, seed, window_length):
+pipe, _ ,tokenizer= utils.load_pipe_from_path(model_path, device, torch.float16 if precision == "fp16" else torch.float32, precision)
+unet_controller = load_unet_controller(pipe, device)
+unet_controller.save_self_attention = False
+unet_controller.use_half_precision = True
+unet_controller.max_heads_to_save = 4
+images, story_image = generate_images(unet_controller, pipe, id_prompt, frame_prompt_list, save_dir, window_length, seed)
+return images, story_image
+if __name__ == "__main__":
+parser = argparse.ArgumentParser(description="Generate images using a specific device.")
+parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for computation (e.g., cuda:0, cpu)')
+parser.add_argument('--model_path', type=str, default='playgroundai/playground-v2.5-1024px-aesthetic', help='Path to the model')
+parser.add_argument('--project_base_path', type=str, default='./results', help='Path to save the generated images')
+parser.add_argument('--id_prompt', type=str, default="A photo of a red fox with coat", help='Initial prompt for image generation')
+parser.add_argument('--frame_prompt_list', type=str, nargs='+', default=[
+"wearing a scarf in a meadow",
+"playing in the snow",
+"at the edge of a village with river",
+], help='List of frame prompts')
+parser.add_argument('--precision', type=str, choices=["fp16", "fp32"], default="fp16", help='Model precision')
+parser.add_argument('--seed', type=int, default=421, help='Random seed for generation')
+parser.add_argument('--window_length', type=int, default=10, help='Window length for story generation')
+parser.add_argument('--save_padding', type=str, default='test', help='Padding for save directory')
+parser.add_argument('--random_seed', action='store_true', help='Use random seed')
+parser.add_argument('--json_path', type=str,)
+args = parser.parse_args()
+if args.random_seed:
+args.seed = random.randint(0, 1000000)
+current_time = datetime.now().strftime("%Y%m%d%H")
+current_time_ = datetime.now().strftime("%M%S")
+save_dir = os.path.join(args.project_base_path, f'result/{current_time}/{current_time_}_{args.save_padding}_seed{args.seed}')
+os.makedirs(save_dir, exist_ok=True)
+if args.json_path is None:
+main(args.device, args.model_path, save_dir, args.id_prompt, args.frame_prompt_list, args.precision, args.seed, args.window_length)
+else:
+import json
+with open(args.json_path, "r") as file:
+data = json.load(file)
+combinations = data["combinations"]
+for combo in combinations:
+main(args.device, args.model_path, save_dir, combo['id_prompt'], combo['frame_prompt_list'], args.precision, args.seed, args.window_length)
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_ENDPOINT"] = "https://hf-mirror.com"
+try:
+import urllib.request
+import urllib.error
+original_urlopen = urllib.request.urlopen
+def urlopen_with_github_mirror(req, *args, **kwargs):
+if isinstance(req, str):
+url = req
+is_string = True
+else:
+if hasattr(req, 'full_url'):
+url = req.full_url
+elif hasattr(req, 'get_full_url'):
+url = req.get_full_url()
+else:
+url = str(req)
+is_string = False
+if '/zipball/' in url or '/tarball/' in url:
+if not is_string and isinstance(req, urllib.request.Request):
+final_req = req
+else:
+final_req = url
+return original_urlopen(final_req, *args, **kwargs)
+if 'github.com' in url and 'ghfast.top' not in url and 'ghproxy.com' not in url:
+url = url.replace('https://github.com/', 'https://ghfast.top/github.com/')
+url = url.replace('http://github.com/', 'https://ghfast.top/github.com/')
+if not is_string and isinstance(req, urllib.request.Request):
+final_req = urllib.request.Request(url, data=req.data if hasattr(req, 'data') else None,
+headers=dict(req.headers) if hasattr(req, 'headers') else {},
+method=req.get_method() if hasattr(req, 'get_method') else None)
+else:
+final_req = url
+return original_urlopen(final_req, *args, **kwargs)
+urllib.request.urlopen = urlopen_with_github_mirror
+except Exception as e:
+print(f"警告: 无法设置 GitHub 镜像 URL 重写: {e}")
+try:
+import requests
+original_get = requests.get
+original_post = requests.post
+def get_with_github_mirror(url, *args, **kwargs):
+if 'github.com' in url and 'ghfast.top' not in url:
+url = url.replace('https://github.com/', 'https://ghfast.top/github.com/')
+url = url.replace('http://github.com/', 'https://ghfast.top/github.com/')
+return original_get(url, *args, **kwargs)
+def post_with_github_mirror(url, *args, **kwargs):
+if 'github.com' in url and 'ghfast.top' not in url:
+url = url.replace('https://github.com/', 'https://ghfast.top/github.com/')
+url = url.replace('http://github.com/', 'https://ghfast.top/github.com/')
+return original_post(url, *args, **kwargs)
+requests.get = get_with_github_mirror
+requests.post = post_with_github_mirror
+except ImportError:
+pass
+except Exception as e:
+print(f"警告: 无法设置 requests GitHub 镜像 URL 重写: {e}")
+os.environ["GIT_TERMINAL_PROMPT"] = "0"
+try:
+import subprocess
+original_run = subprocess.run
+original_call = subprocess.call
+original_Popen = subprocess.Popen
+def process_git_command(cmd):
+if not isinstance(cmd, (list, tuple)):
+return cmd
+cmd = list(cmd)
+if any('git' in str(arg).lower() for arg in cmd):
+for i, arg in enumerate(cmd):
+if isinstance(arg, str) and 'github.com' in arg and 'ghfast.top' not in arg:
+cmd[i] = arg.replace('https://github.com/', 'https://ghfast.top/github.com/')
+cmd[i] = cmd[i].replace('http://github.com/', 'https://ghfast.top/github.com/')
+return cmd
+def run_with_github_mirror(*args, **kwargs):
+if args and isinstance(args[0], (list, tuple)):
+args = (process_git_command(args[0]),) + args[1:]
+return original_run(*args, **kwargs)
+def call_with_github_mirror(*args, **kwargs):
+if args and isinstance(args[0], (list, tuple)):
+args = (process_git_command(args[0]),) + args[1:]
+return original_call(*args, **kwargs)
+def Popen_with_github_mirror(*args, **kwargs):
+if args and isinstance(args[0], (list, tuple)):
+args = (process_git_command(args[0]),) + args[1:]
+return original_Popen(*args, **kwargs)
+subprocess.run = run_with_github_mirror
+subprocess.call = call_with_github_mirror
+subprocess.Popen = Popen_with_github_mirror
+except Exception as e:
+print(f"警告: 无法设置 subprocess GitHub 镜像 URL 重写: {e}")
+from dreamsim import dreamsim
+from PIL import Image
+from pathlib import Path
+from itertools import combinations
+import torch
+from transformers import CLIPProcessor, CLIPModel
+import argparse
+import clip
+import shutil
+from carvekit.api.high import HiInterface
+try:
+from carvekit.utils import download_models
+if hasattr(download_models, 'fallback_downloader'):
+download_models.fallback_downloader.base_url = "https://hf-mirror.com"
+download_models.fallback_downloader._name = "hf-mirror.com"
+if hasattr(download_models, 'downloader') and hasattr(download_models.downloader, '_fallback_downloader'):
+if download_models.downloader._fallback_downloader:
+download_models.downloader._fallback_downloader.base_url = "https://hf-mirror.com"
+download_models.downloader._fallback_downloader._name = "hf-mirror.com"
+except Exception as e:
+print(f"警告: 无法修改 carvekit 下载器配置: {e}")
+import numpy as np
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+import sklearn.preprocessing
+import yaml
+interface = HiInterface(object_type="object",
+batch_size_seg=5,
+batch_size_matting=1,
+device='cuda' if torch.cuda.is_available() else 'cpu',
+seg_mask_size=640,
+matting_mask_size=2048,
+trimap_prob_threshold=231,
+trimap_dilation=30,
+trimap_erosion_iters=5,
+fp16=False)
+def replace_bg_with_noise(image_path):
+image = interface([image_path])[0].convert('RGB')
+image_array = np.array(image)
+black_pixels = np.all(image_array == [130, 130, 130], axis=-1)
+noise = np.random.randint(0, 256, size=image_array.shape, dtype=np.uint8)
+image_array[black_pixels] = noise[black_pixels]
+image = Image.fromarray(image_array)
+return image
+def get_clip_score_for_image_text(image, caption, model, device):
+preprocess = Compose([
+Resize(224, interpolation=Image.BICUBIC),
+CenterCrop(224),
+lambda image: image.convert("RGB"),
+ToTensor(),
+Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+])
+image = preprocess(image)
+image = image.unsqueeze(0)
+caption = 'A photo depicts ' + caption if not caption.startswith('A photo depicts') else caption
+caption_tokens = clip.tokenize(caption, truncate=True).squeeze()
+caption_tokens = caption_tokens.unsqueeze(0)
+image = image.to(device)
+caption_tokens = caption_tokens.to(device)
+image_features = model.encode_image(image)
+text_features = model.encode_text(caption_tokens)
+image_features = sklearn.preprocessing.normalize(image_features.cpu().detach().numpy(), axis=1)
+text_features = sklearn.preprocessing.normalize(text_features.cpu().detach().numpy(), axis=1)
+clip_score = 2.5 * np.sum(image_features * text_features)
+return clip_score
+def load_yaml_subject_mapping(yaml_path):
+subject_mapping = {}
+if not os.path.exists(yaml_path):
+print(f"警告: YAML文件不存在: {yaml_path}")
+return subject_mapping
+with open(yaml_path, 'r', encoding='utf-8') as file:
+refined_data = yaml.safe_load(file)
+for subject_domain, subject_domain_instances in refined_data.items():
+for refined_instance in subject_domain_instances:
+refined_style = refined_instance.get("style", "").strip()
+refined_subject = refined_instance.get("subject", "").strip()
+new_subject = refined_instance.get("new_subject", "").strip()
+if refined_subject and new_subject:
+key = (refined_style, refined_subject)
+subject_mapping[key] = new_subject
+return subject_mapping
+def replace_subject_with_new_subject(filename, subject_mapping):
+filename_without_ext = os.path.splitext(filename)[0]
+sorted_items = sorted(
+subject_mapping.items(),
+key=lambda x: len(x[0][0] + " " + x[0][1]) if x[0][0] else len(x[0][1]),
+reverse=True
+)
+for (style, subject), new_subject in sorted_items:
+if style:
+prefix = f"{style} {subject}"
+else:
+prefix = subject
+if filename_without_ext.startswith(prefix):
+if len(filename_without_ext) == len(prefix) or filename_without_ext[len(prefix)] == ' ':
+remaining = filename_without_ext[len(prefix):].strip()
+if style:
+if remaining:
+new_prompt = f"{style} {new_subject} {remaining}"
+else:
+new_prompt = f"{style} {new_subject}"
+else:
+if remaining:
+new_prompt = f"{new_subject} {remaining}"
+else:
+new_prompt = new_subject
+return new_prompt
+return filename_without_ext
+def calculate_avg_clip_text_score(folder_path, single_folder, prefix=None, use_new_subject=False, yaml_path=None):
+model, _ = clip.load('ViT-B/32', device="cuda", jit=False)
+model.eval()
+subject_mapping = {}
+if use_new_subject:
+if yaml_path is None:
+yaml_path = os.path.join(os.path.dirname(__file__), "consistory+1p1s_allprompt_refined.yaml")
+subject_mapping = load_yaml_subject_mapping(yaml_path)
+if subject_mapping:
+print(f"已加载 {len(subject_mapping)} 个subject映射")
+else:
+print("警告: 未找到任何subject映射，将使用原始文件名")
+if single_folder:
+subfolders = [folder_path]
+else:
+subfolders = [name for name in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, name))]
+if prefix:
+subfolders = [name for name in subfolders if name.startswith(prefix)]
+avg_distances = {}
+for subfolder_name in subfolders:
+images = []
+text_prompts = []
+avg_distance = 0
+subfolder_path = os.path.join(folder_path, subfolder_name)
+for f in Path(subfolder_path).rglob('*'):
+if f.suffix.lower() in {'.png', '.jpg'}:
+images.append(Image.open(f))
+filename = os.path.basename(f)
+if use_new_subject and subject_mapping:
+text_prompt = replace_subject_with_new_subject(filename, subject_mapping)
+else:
+text_prompt = filename
+text_prompts.append(text_prompt)
+if not images:
+print(f"No images found in {subfolder_name}, skipping...")
+continue
+for image, text_prompt in zip(images, text_prompts):
+distance = get_clip_score_for_image_text(image, text_prompt, model, "cuda")
+avg_distance += distance.item()
+avg_distance /= len(images)
+avg_distances[subfolder_name] = avg_distance
+return avg_distances
+def compute_dreamsim_distance(image1, image2, model, processor):
+features1 = processor(image1).to("cuda")
+features2 = processor(image2).to("cuda")
+distance = model(features1, features2)
+return distance
+def compute_clip_distance(image1, image2, model, processor):
+inputs1 = processor(images=image1, return_tensors="pt")
+with torch.no_grad():
+features1 = model.get_image_features(**inputs1)
+inputs2 = processor(images=image2, return_tensors="pt")
+with torch.no_grad():
+features2 = model.get_image_features(**inputs2)
+distance = torch.nn.functional.cosine_similarity(features1, features2)
+return distance
+def safe_load_dreamsim(max_retries=2):
+for attempt in range(max_retries):
+try:
+model, processor = dreamsim(pretrained=True)
+return model, processor
+except (RuntimeError, OSError) as e:
+error_msg = str(e).lower()
+if 'zip archive' in error_msg or 'central directory' in error_msg or 'failed reading' in error_msg:
+print(f"检测到缓存损坏错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+cache_dirs = [
+'./models/facebookresearch_dino_main',
+os.path.join(torch.hub.get_dir(), 'facebookresearch_dino_main'),
+]
+for cache_dir in cache_dirs:
+if os.path.exists(cache_dir):
+print(f"清理缓存目录: {cache_dir}")
+try:
+shutil.rmtree(cache_dir)
+except Exception as cleanup_error:
+print(f"清理缓存目录失败: {cleanup_error}")
+hub_cache_dir = torch.hub.get_dir()
+dino_weight_patterns = ['dino_vitbase16_pretrain.pth']
+for root, dirs, files in os.walk(hub_cache_dir):
+for file in files:
+if any(pattern in file for pattern in dino_weight_patterns):
+file_path = os.path.join(root, file)
+print(f"删除损坏的权重文件: {file_path}")
+try:
+os.remove(file_path)
+except Exception as cleanup_error:
+print(f"删除权重文件失败: {cleanup_error}")
+if attempt == max_retries - 1:
+raise RuntimeError(f"加载 dreamsim 模型失败，已重试 {max_retries} 次。请检查网络连接或手动清理缓存。") from e
+print("缓存已清理，正在重试...")
+else:
+raise
+raise RuntimeError(f"加载 dreamsim 模型失败，已重试 {max_retries} 次。")
+def calculate_avg_distance(folder_path, mode, remove_bg, single_folder, prefix=None):
+if mode == "dreamsim":
+model, processor = safe_load_dreamsim()
+elif mode == "clip_image":
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+if single_folder:
+subfolders = [folder_path]
+else:
+subfolders = [name for name in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, name))]
+if prefix:
+subfolders = [name for name in subfolders if name.startswith(prefix)]
+avg_distances = {}
+for subfolder_name in subfolders:
+images = []
+avg_distance = 0
+subfolder_path = os.path.join(folder_path, subfolder_name)
+for f in Path(subfolder_path).rglob('*'):
+if f.suffix.lower() in {'.png', '.jpg'}:
+if remove_bg:
+images.append(replace_bg_with_noise(f))
+else:
+images.append(Image.open(f))
+if not images:
+print(f"No images found in {subfolder_name}, skipping...")
+continue
+if len(images) < 2:
+avg_distances[subfolder_name] = float('nan')
+continue
+for combo in combinations(images, 2):
+if mode == "dreamsim":
+distance = compute_dreamsim_distance(combo[0], combo[1], model, processor)
+elif mode == "clip_image":
+distance = compute_clip_distance(combo[0], combo[1], model, processor)
+avg_distance += distance.item()
+avg_distance /= len(images) * (len(images) - 1) / 2
+avg_distances[subfolder_name] = avg_distance
+print(f"Average distance for {subfolder_name}: {avg_distance}")
+return avg_distances
+def main():
+parser = argparse.ArgumentParser(description="Calculate image similarities using DreamSim or CLIP.")
+parser.add_argument('--mode', type=str, choices=['dreamsim', 'clip_image', 'clip_text'],
+help='Mode of operation: "dreamsim" or "clip_image"')
+parser.add_argument('--folder', type=str, help='Path to the folder containing image subfolders')
+parser.add_argument('--image1', type=str, help='Path to the first image for pairwise comparison')
+parser.add_argument('--image2', type=str, help='Path to the second image for pairwise comparison')
+parser.add_argument('--image_clip_text', type=str,
+help='Path to the image for clip_text score, image_name as text_prompt')
+parser.add_argument('--remove_background', action='store_true', help='Remove background from images')
+parser.add_argument('--single_folder', action='store_true', help='single_folder')
+parser.add_argument('--prefix', type=str, default=None, help='Only test folders with this prefix (e.g., "human" to test only folders starting with "human")')
+parser.add_argument('--allprefix', action='store_true', help='Test all different prefixes (humans, animals, etc.) separately and save results by category')
+parser.add_argument('--new_subject', action='store_true', help='Use new_subject from YAML file to replace subject in prompts when calculating clip_text score')
+parser.add_argument('--yaml_path', type=str, default=None, help='Path to YAML file containing subject and new_subject mappings (default: consistory+1p1s_allprompt_refined.yaml in same directory)')
+parser.add_argument('--output_file', type=str, default=None, help='Output file path to save results (default: test_result/{mode}_results_{timestamp}.txt)')
+args = parser.parse_args()
+if args.image_clip_text:
+image = Image.open(args.image_clip_text).convert("RGB")
+caption = os.path.basename(args.image_clip_text)
+model, _ = clip.load('ViT-B/32', device="cuda", jit=False)
+model.eval()
+clip_score = get_clip_score_for_image_text(image, caption, model, "cuda")
+print(f"Clip_score:{clip_score}")
+elif args.image1 and args.image2:
+if args.remove_background == True:
+image1 = replace_bg_with_noise(args.image1)
+image2 = replace_bg_with_noise(args.image2)
+else:
+image1 = Image.open(args.image1).convert("RGB")
+image2 = Image.open(args.image2).convert("RGB")
+if args.mode == 'dreamsim':
+model, processor = safe_load_dreamsim()
+distance = compute_dreamsim_distance(image1, image2, model, processor)
+elif args.mode == 'clip_image':
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+distance = compute_clip_distance(image1, image2, model, processor)
+print(f"Distance: {distance}")
+else:
+if args.allprefix:
+import re
+from collections import defaultdict
+from datetime import datetime
+if not os.path.isdir(args.folder):
+print(f"错误: {args.folder} 不是一个有效的目录")
+return
+subfolders = [name for name in os.listdir(args.folder)
+if os.path.isdir(os.path.join(args.folder, name))]
+prefix_categories = defaultdict(list)
+for subfolder in subfolders:
+match = re.match(r'^([a-zA-Z]+)_\d+$', subfolder)
+if match:
+prefix = match.group(1)
+prefix_categories[prefix].append(subfolder)
+if not prefix_categories:
+print("警告: 未找到任何符合 prefix_number 格式的子目录，将使用普通模式")
+args.allprefix = False
+else:
+print(f"检测到 {len(prefix_categories)} 个类别: {', '.join(prefix_categories.keys())}")
+category_results = {}
+all_subfolders_results = {}
+for category, category_subfolders in prefix_categories.items():
+print(f"\n{'='*60}")
+print(f"测试类别: {category} ({len(category_subfolders)} 个子目录)")
+print(f"{'='*60}")
+if args.mode == 'dreamsim' or args.mode == 'clip_image':
+category_avg_distances = calculate_avg_distance(
+args.folder, args.mode, args.remove_background,
+args.single_folder, category
+)
+elif args.mode == 'clip_text':
+category_avg_distances = calculate_avg_clip_text_score(
+args.folder, args.single_folder, category,
+args.new_subject, args.yaml_path
+)
+category_total = 0
+valid_count = 0
+for subfolder, avg_distance in category_avg_distances.items():
+is_valid = not (isinstance(avg_distance, float) and (avg_distance != avg_distance))
+if is_valid:
+category_total += avg_distance
+valid_count += 1
+all_subfolders_results[subfolder] = avg_distance
+print(f"Average distance for {subfolder}: {avg_distance}")
+if valid_count > 0:
+category_avg = category_total / valid_count
+category_results[category] = {
+'avg_distance': category_avg,
+'subfolders': category_avg_distances,
+'count': valid_count
+}
+print(f"\n{category} 类别平均距离: {category_avg}")
+else:
+category_results[category] = {
+'avg_distance': float('nan'),
+'subfolders': category_avg_distances,
+'count': 0
+}
+print(f"\n{category} 类别: 无有效数据")
+print(f"\n{'='*60}")
+print("总体结果")
+print(f"{'='*60}")
+total_avg_distance = 0
+total_valid_count = 0
+for category, result in category_results.items():
+if not (isinstance(result['avg_distance'], float) and (result['avg_distance'] != result['avg_distance'])):
+total_avg_distance += result['avg_distance'] * result['count']
+total_valid_count += result['count']
+if total_valid_count > 0:
+overall_avg = total_avg_distance / total_valid_count
+print(f"总体平均距离 ({args.mode}_total_avg_distance): {overall_avg}")
+else:
+overall_avg = float('nan')
+print("总体平均距离: 无有效数据")
+if args.output_file is None:
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_dir = os.path.join(os.path.dirname(__file__), 'test_result')
+os.makedirs(output_dir, exist_ok=True)
+args.output_file = os.path.join(output_dir, f"{args.mode}_results_{timestamp}.txt")
+with open(args.output_file, 'w', encoding='utf-8') as f:
+f.write(f"{'='*60}\n")
+f.write(f"测试结果 - {args.mode}\n")
+f.write(f"测试目录: {args.folder}\n")
+f.write(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+f.write(f"{'='*60}\n\n")
+for category, result in category_results.items():
+f.write(f"类别: {category}\n")
+f.write(f" 平均距离: {result['avg_distance']}\n")
+f.write(f" 子目录数量: {result['count']}\n")
+f.write(f" 详细结果:\n")
+for subfolder, distance in result['subfolders'].items():
+f.write(f" {subfolder}: {distance}\n")
+f.write("\n")
+f.write(f"{'='*60}\n")
+f.write(f"总体结果\n")
+f.write(f"{'='*60}\n")
+f.write(f"{args.mode}_total_avg_distance: {overall_avg}\n")
+f.write(f"总有效子目录数: {total_valid_count}\n")
+print(f"\n结果已保存到: {args.output_file}")
+return
+if args.mode == 'dreamsim' or args.mode == 'clip_image':
+avg_distances = calculate_avg_distance(args.folder, args.mode, args.remove_background, args.single_folder, args.prefix)
+elif args.mode == 'clip_text':
+avg_distances = calculate_avg_clip_text_score(args.folder, args.single_folder, args.prefix, args.new_subject, args.yaml_path)
+total_avg_distance = 0
+for subfolder, avg_distance in avg_distances.items():
+total_avg_distance += round(avg_distance, 5)
+print(f"Average distance for {subfolder}: {avg_distance}")
+total_avg_distance /= len(avg_distances)
+print(f"{args.mode}_total_avg_distance: {total_avg_distance}")
+if __name__ == "__main__":
+main()
+import os
+import sys
+import yaml
+import re
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+from openai import OpenAI
+OPENAI_AVAILABLE = True
+except ImportError:
+OPENAI_AVAILABLE = False
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+"generate_story_yaml",
+os.path.join(os.path.dirname(__file__), "generate_story_yaml.py")
+)
+generate_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(generate_module)
+generate_story_config_with_chatgpt = generate_module.generate_story_config_with_chatgpt
+save_to_yaml = generate_module.save_to_yaml
+def main_interactive():
+print("\n" + "="*60)
+print("故事配置生成器 - 交互式模式")
+print("="*60 + "\n")
+if not OPENAI_AVAILABLE:
+print("❌ 错误: openai 库未安装")
+print("请运行: pip install openai")
+return
+print("请输入以下信息:\n")
+story_description = input("故事描述 (例如: 生成火柴人的故事): ").strip()
+if not story_description:
+print("❌ 错误: 故事描述不能为空")
+return
+try:
+sequence_length = int(input("序列长度/图像数量 (默认 5): ").strip() or "5")
+if sequence_length < 1 or sequence_length > 50:
+print("⚠️ 警告: 序列长度建议在 1-50 之间，将使用 5")
+sequence_length = 5
+except ValueError:
+print("⚠️ 警告: 输入无效，使用默认值 5")
+sequence_length = 5
+api_key = input("OpenAI API Key: ").strip()
+if not api_key:
+print("❌ 错误: API Key 不能为空")
+return
+base_url = input("API Base URL (可选，直接回车使用默认): ").strip()
+if not base_url:
+base_url = None
+model = input("模型名称 (默认 gpt-3.5-turbo): ").strip() or "gpt-3.5-turbo"
+output_file = input("输出文件路径 (默认 generated_story.yaml): ").strip() or "generated_story.yaml"
+category = input("分类名称 (默认 custom): ").strip() or "custom"
+print("\n" + "="*60)
+print("开始生成配置...")
+print("="*60 + "\n")
+try:
+config = generate_story_config_with_chatgpt(
+story_description=story_description,
+sequence_length=sequence_length,
+api_key=api_key,
+base_url=base_url,
+model=model
+)
+print("\n" + "="*60)
+print("生成的配置预览:")
+print("="*60)
+print(f"\nconcept_token: {config['concept_token']}")
+print(f"\nstyle: {config['style']}")
+print(f"\nsubject: {config['subject']}")
+print(f"\nnew_subject: {config['new_subject']}")
+print(f"\nsettings ({len(config['settings'])} 个场景):")
+for i, setting in enumerate(config['settings'], 1):
+print(f" {i}. {setting}")
+print("\n" + "="*60)
+confirm = input(f"\n是否保存到文件 '{output_file}'? (y/n, 默认 y): ").strip().lower()
+if confirm in ['', 'y', 'yes']:
+save_to_yaml(config, output_file, category)
+print(f"\n✅ 完成！配置文件已保存到: {output_file}")
+print(f"\n可以在 gen_benchmark.py 中使用此配置文件进行图像生成。")
+else:
+print("\n已取消保存。")
+except Exception as e:
+print(f"\n❌ 错误: {str(e)}")
+import traceback
+traceback.print_exc()
+if __name__ == "__main__":
+main_interactive()
+import os
+import sys
+from PIL import Image, ImageDraw, ImageFont
+import argparse
+from pathlib import Path
+def merge_images_horizontally(folder_path, output_dir=None):
+folder_path = Path(folder_path)
+if not folder_path.exists():
+raise ValueError(f"文件夹不存在: {folder_path}")
+if not folder_path.is_dir():
+raise ValueError(f"路径不是文件夹: {folder_path}")
+image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+image_files = []
+for ext in image_extensions:
+image_files.extend(folder_path.glob(f'*{ext}'))
+image_files.extend(folder_path.glob(f'*{ext.upper()}'))
+image_files = [f for f in image_files if not f.name.startswith('story_image')]
+if not image_files:
+raise ValueError(f"文件夹中没有找到图像文件: {folder_path}")
+image_files.sort(key=lambda x: x.name)
+print(f"找到 {len(image_files)} 张图像:")
+for img_file in image_files:
+print(f" - {img_file.name}")
+filenames = [f.stem for f in image_files]
+def find_common_prefix(strings):
+if not strings:
+return ""
+if len(strings) == 1:
+return strings[0]
+min_len = min(len(s) for s in strings)
+prefix = ""
+for i in range(min_len):
+char = strings[0][i]
+if all(s[i] == char for s in strings):
+prefix += char
+else:
+break
+last_space = prefix.rfind(' ')
+if last_space > 0:
+prefix = prefix[:last_space]
+return prefix
+common_prefix = find_common_prefix(filenames)
+action_prompts = []
+for filename in filenames:
+if filename.startswith(common_prefix):
+action_prompt = filename[len(common_prefix):].strip()
+if action_prompt.startswith(' '):
+action_prompt = action_prompt[1:]
+action_prompts.append(action_prompt)
+else:
+action_prompts.append(filename)
+print(f"\n公共 id prompt: {common_prefix}")
+print(f"动作 prompts:")
+for i, action in enumerate(action_prompts):
+print(f" [{i+1}] {action}")
+images = []
+for img_file in image_files:
+try:
+img = Image.open(img_file)
+if img.mode != 'RGB':
+img = img.convert('RGB')
+images.append(img)
+except Exception as e:
+print(f"警告: 无法读取图像 {img_file.name}: {e}")
+continue
+if not images:
+raise ValueError(f"无法读取任何图像文件")
+heights = [img.height for img in images]
+min_height = min(heights)
+max_height = max(heights)
+if min_height != max_height:
+print(f"警告: 图像高度不一致（最小: {min_height}, 最大: {max_height}），统一调整为 {min_height}")
+resized_images = []
+for img in images:
+aspect_ratio = img.width / img.height
+new_width = int(min_height * aspect_ratio)
+resized_img = img.resize((new_width, min_height), Image.Resampling.LANCZOS)
+resized_images.append(resized_img)
+images = resized_images
+total_width = sum(img.width for img in images)
+uniform_height = images[0].height
+try:
+font_size_title = 60
+font_size_action = 48
+try:
+title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size_title)
+action_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size_action)
+except:
+try:
+title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size_title)
+action_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size_action)
+except:
+title_font = ImageFont.load_default()
+action_font = ImageFont.load_default()
+except:
+title_font = ImageFont.load_default()
+action_font = ImageFont.load_default()
+padding_top = 20
+padding_bottom = 20
+padding_between = 15
+padding_action = 10
+try:
+test_img = Image.new('RGB', (100, 100), 'white')
+test_draw = ImageDraw.Draw(test_img)
+bbox_title = test_draw.textbbox((0, 0), common_prefix, font=title_font)
+title_height = bbox_title[3] - bbox_title[1] + padding_top + padding_between
+bbox_action = test_draw.textbbox((0, 0), "Test", font=action_font)
+action_height = bbox_action[3] - bbox_action[1] + padding_action
+except:
+title_height = 60
+action_height = 40
+image_y = title_height
+temp_image = Image.new('RGB', (total_width, 100), color='white')
+draw = ImageDraw.Draw(temp_image)
+max_lines = 1
+action_prompts_lines = []
+for action_prompt, img in zip(action_prompts, images):
+if action_prompt:
+img_width = img.width
+margin = 20
+max_text_width = img_width - margin
+try:
+bbox = draw.textbbox((0, 0), action_prompt, font=action_font)
+text_width = bbox[2] - bbox[0]
+except:
+text_width = len(action_prompt) * 8
+if text_width > max_text_width:
+words = action_prompt.split(' ')
+lines = []
+current_line = []
+for word in words:
+test_line = ' '.join(current_line + [word]) if current_line else word
+try:
+bbox = draw.textbbox((0, 0), test_line, font=action_font)
+line_width = bbox[2] - bbox[0]
+except:
+line_width = len(test_line) * 8
+if line_width <= max_text_width:
+current_line.append(word)
+else:
+if current_line:
+lines.append(' '.join(current_line))
+current_line = [word]
+if current_line:
+lines.append(' '.join(current_line))
+action_prompts_lines.append(lines)
+max_lines = max(max_lines, len(lines))
+else:
+action_prompts_lines.append([action_prompt])
+else:
+action_prompts_lines.append([])
+try:
+bbox = draw.textbbox((0, 0), "Test", font=action_font)
+single_line_height = bbox[3] - bbox[1]
+except:
+single_line_height = 35
+line_spacing = 5
+action_height = max_lines * single_line_height + (max_lines - 1) * line_spacing + padding_action * 2
+final_height = title_height + uniform_height + action_height + padding_bottom
+merged_image = Image.new('RGB', (total_width, final_height), color='white')
+draw = ImageDraw.Draw(merged_image)
+if common_prefix:
+try:
+bbox = draw.textbbox((0, 0), common_prefix, font=title_font)
+text_width = bbox[2] - bbox[0]
+text_x = (total_width - text_width) // 2
+text_y = padding_top
+draw.text((text_x, text_y), common_prefix, fill='black', font=title_font)
+except Exception as e:
+print(f"警告: 无法绘制标题文字: {e}")
+draw.text((10, padding_top), common_prefix, fill='black')
+x_offset = 0
+image_widths = []
+for img in images:
+merged_image.paste(img, (x_offset, image_y))
+image_widths.append(x_offset)
+x_offset += img.width
+action_y = image_y + uniform_height + padding_action
+for x_offset, lines, img in zip(image_widths, action_prompts_lines, images):
+if lines:
+img_width = img.width
+for line_idx, line in enumerate(lines):
+try:
+bbox = draw.textbbox((0, 0), line, font=action_font)
+line_text_width = bbox[2] - bbox[0]
+except:
+line_text_width = len(line) * 8
+line_x = x_offset + (img_width - line_text_width) // 2
+line_y = action_y + line_idx * (single_line_height + line_spacing)
+try:
+draw.text((line_x, line_y), line, fill='black', font=action_font)
+except:
+draw.text((line_x, line_y), line, fill='black')
+if output_dir is None:
+script_dir = Path(__file__).parent
+output_dir = script_dir / 'test_result'
+else:
+output_dir = Path(output_dir)
+output_dir.mkdir(parents=True, exist_ok=True)
+folder_parts = folder_path.parts
+result_idx = -1
+for i, part in enumerate(folder_parts):
+if 'result' in part.lower():
+result_idx = i
+break
+if result_idx >= 0 and len(folder_parts) >= result_idx + 2:
+benchmark_name = folder_parts[result_idx + 1]
+folder_name = folder_parts[-1]
+output_filename = f"{benchmark_name}+{folder_name}.jpg"
+else:
+output_filename = f"{folder_path.name}_merged.jpg"
+output_path = output_dir / output_filename
+merged_image.save(output_path, 'JPEG', quality=95)
+print(f"\n合并完成！")
+print(f"输出文件: {output_path}")
+print(f"图像尺寸: {total_width} x {final_height}")
+print(f"包含图像数: {len(images)}")
+return output_path
+def batch_merge_images(base_dir, prefix=None, output_base_dir=None):
+base_dir = Path(base_dir)
+if not base_dir.exists():
+raise ValueError(f"目录不存在: {base_dir}")
+if not base_dir.is_dir():
+raise ValueError(f"路径不是目录: {base_dir}")
+if prefix:
+matching_folders = [f for f in base_dir.iterdir() if f.is_dir() and f.name.startswith(prefix)]
+if not matching_folders:
+raise ValueError(f"在 {base_dir} 中没有找到以 '{prefix}' 开头的子文件夹")
+else:
+matching_folders = [f for f in base_dir.iterdir() if f.is_dir()]
+if not matching_folders:
+raise ValueError(f"在 {base_dir} 中没有找到子文件夹")
+matching_folders.sort(key=lambda x: x.name)
+if prefix:
+print(f"找到 {len(matching_folders)} 个以 '{prefix}' 开头的子文件夹:")
+else:
+print(f"找到 {len(matching_folders)} 个子文件夹:")
+for folder in matching_folders:
+print(f" - {folder.name}")
+if output_base_dir is None:
+base_parts = base_dir.parts
+result_idx = -1
+for i, part in enumerate(base_parts):
+if 'result' in part.lower():
+result_idx = i
+break
+if result_idx >= 0:
+result_path = Path(*base_parts[:result_idx + 1])
+output_base_dir = result_path / 'visual_result' / base_dir.name
+else:
+output_base_dir = base_dir.parent / 'visual_result' / base_dir.name
+else:
+output_base_dir = Path(output_base_dir) / base_dir.name
+output_base_dir.mkdir(parents=True, exist_ok=True)
+print(f"\n输出目录: {output_base_dir}")
+output_paths = []
+for folder in matching_folders:
+print(f"\n{'='*60}")
+print(f"处理文件夹: {folder.name}")
+print(f"{'='*60}")
+try:
+output_path = merge_images_horizontally(folder, output_base_dir)
+output_paths.append(output_path)
+print(f"✓ 成功处理: {folder.name}")
+except Exception as e:
+print(f"✗ 处理失败 {folder.name}: {e}", file=sys.stderr)
+continue
+print(f"\n{'='*60}")
+print(f"批量处理完成！共处理 {len(output_paths)} 个文件夹")
+print(f"输出目录: {output_base_dir}")
+print(f"{'='*60}")
+return output_paths
+def main():
+parser = argparse.ArgumentParser(
+description='将指定文件夹中的图像横向合并成一张大图',
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog=
+)
+parser.add_argument('folder_path', type=str, help='包含图像的文件夹路径（单个文件夹）或包含子文件夹的目录（批量处理时）')
+parser.add_argument('--output-dir', type=str, default=None,
+help='输出目录（默认: resource/test_result 或 result/visual_result）')
+parser.add_argument('--prefix', type=str, default=None,
+help='批量处理模式：指定子文件夹前缀（例如: animals）。如果不指定prefix且输入路径是目录，则自动处理所有子文件夹')
+args = parser.parse_args()
+try:
+input_path = Path(args.folder_path)
+if not input_path.exists():
+raise ValueError(f"路径不存在: {input_path}")
+if args.prefix:
+output_paths = batch_merge_images(args.folder_path, args.prefix, args.output_dir)
+print(f"\n成功处理 {len(output_paths)} 个文件夹")
+elif input_path.is_dir():
+subdirs = [f for f in input_path.iterdir() if f.is_dir()]
+if subdirs:
+print(f"检测到目录下有 {len(subdirs)} 个子文件夹，自动启用批量处理模式")
+output_paths = batch_merge_images(args.folder_path, None, args.output_dir)
+print(f"\n成功处理 {len(output_paths)} 个文件夹")
+else:
+output_path = merge_images_horizontally(args.folder_path, args.output_dir)
+print(f"\n成功保存到: {output_path}")
+else:
+output_path = merge_images_horizontally(args.folder_path, args.output_dir)
+print(f"\n成功保存到: {output_path}")
+except Exception as e:
+print(f"错误: {e}", file=sys.stderr)
+sys.exit(1)
+if __name__ == '__main__':
+main()
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import torch.nn.functional as F
+from torch.autograd import grad
+import torch
+from transformers import (
+CLIPImageProcessor,
+CLIPTextModel,
+CLIPTextModelWithProjection,
+CLIPTokenizer,
+CLIPVisionModelWithProjection,
+)
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import (
+FromSingleFileMixin,
+IPAdapterMixin,
+StableDiffusionXLLoraLoaderMixin,
+TextualInversionLoaderMixin,
+)
+from diffusers.models import AutoencoderKL, ImageProjection, UNet2DConditionModel
+from diffusers.models.attention_processor import (
+AttnProcessor2_0,
+FusedAttnProcessor2_0,
+LoRAAttnProcessor2_0,
+LoRAXFormersAttnProcessor,
+XFormersAttnProcessor,
+)
+from diffusers.models.lora import adjust_lora_scale_text_encoder
+from diffusers.schedulers import KarrasDiffusionSchedulers
+from diffusers.utils import (
+USE_PEFT_BACKEND,
+deprecate,
+is_invisible_watermark_available,
+is_torch_xla_available,
+logging,
+replace_example_docstring,
+scale_lora_layers,
+unscale_lora_layers,
+)
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
+from unet.unet_controller import UNetController
+import unet.utils as utils
+if is_invisible_watermark_available():
+from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
+logger = logging.get_logger(__name__)
+EXAMPLE_DOC_STRING =
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+return noise_cfg
+def retrieve_timesteps(
+scheduler,
+num_inference_steps: Optional[int] = None,
+device: Optional[Union[str, torch.device]] = None,
+timesteps: Optional[List[int]] = None,
+**kwargs,
+):
+if timesteps is not None:
+accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+if not accepts_timesteps:
+raise ValueError(
+f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+f" timestep schedules. Please check whether you are using the correct scheduler."
+)
+scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+timesteps = scheduler.timesteps
+num_inference_steps = len(timesteps)
+else:
+scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+timesteps = scheduler.timesteps
+return timesteps, num_inference_steps
+class StableDiffusionXLPipeline(
+DiffusionPipeline,
+StableDiffusionMixin,
+FromSingleFileMixin,
+StableDiffusionXLLoraLoaderMixin,
+TextualInversionLoaderMixin,
+IPAdapterMixin,
+):
+r
+model_cpu_offload_seq = "text_encoder->text_encoder_2->image_encoder->unet->vae"
+_optional_components = [
+"tokenizer",
+"tokenizer_2",
+"text_encoder",
+"text_encoder_2",
+"image_encoder",
+"feature_extractor",
+]
+_callback_tensor_inputs = [
+"latents",
+"prompt_embeds",
+"negative_prompt_embeds",
+"add_text_embeds",
+"add_time_ids",
+"negative_pooled_prompt_embeds",
+"negative_add_time_ids",
+]
+def __init__(
+self,
+vae: AutoencoderKL,
+text_encoder: CLIPTextModel,
+text_encoder_2: CLIPTextModelWithProjection,
+tokenizer: CLIPTokenizer,
+tokenizer_2: CLIPTokenizer,
+unet: UNet2DConditionModel,
+scheduler: KarrasDiffusionSchedulers,
+image_encoder: CLIPVisionModelWithProjection = None,
+feature_extractor: CLIPImageProcessor = None,
+force_zeros_for_empty_prompt: bool = True,
+add_watermarker: Optional[bool] = None,
+):
+super().__init__()
+self.register_modules(
+vae=vae,
+text_encoder=text_encoder,
+text_encoder_2=text_encoder_2,
+tokenizer=tokenizer,
+tokenizer_2=tokenizer_2,
+unet=unet,
+scheduler=scheduler,
+image_encoder=image_encoder,
+feature_extractor=feature_extractor,
+)
+self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
+self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+self.default_sample_size = self.unet.config.sample_size
+add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
+if add_watermarker:
+self.watermark = StableDiffusionXLWatermarker()
+else:
+self.watermark = None
+def encode_prompt(
+self,
+prompt: str,
+prompt_2: Optional[str] = None,
+device: Optional[torch.device] = None,
+num_images_per_prompt: int = 1,
+do_classifier_free_guidance: bool = True,
+negative_prompt: Optional[str] = None,
+negative_prompt_2: Optional[str] = None,
+prompt_embeds: Optional[torch.FloatTensor] = None,
+negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+lora_scale: Optional[float] = None,
+clip_skip: Optional[int] = None,
+unet_controller: Optional[UNetController] = None,
+):
+r
+device = device or self._execution_device
+if lora_scale is not None and isinstance(self, StableDiffusionXLLoraLoaderMixin):
+self._lora_scale = lora_scale
+if self.text_encoder is not None:
+if not USE_PEFT_BACKEND:
+adjust_lora_scale_text_encoder(self.text_encoder, lora_scale)
+else:
+scale_lora_layers(self.text_encoder, lora_scale)
+if self.text_encoder_2 is not None:
+if not USE_PEFT_BACKEND:
+adjust_lora_scale_text_encoder(self.text_encoder_2, lora_scale)
+else:
+scale_lora_layers(self.text_encoder_2, lora_scale)
+prompt = [prompt] if isinstance(prompt, str) else prompt
+if prompt is not None:
+batch_size = len(prompt)
+else:
+batch_size = prompt_embeds.shape[0]
+tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer is not None else [self.tokenizer_2]
+text_encoders = (
+[self.text_encoder, self.text_encoder_2] if self.text_encoder is not None else [self.text_encoder_2]
+)
+if prompt_embeds is None:
+prompt_2 = prompt_2 or prompt
+prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+prompt_embeds_list = []
+prompts = [prompt, prompt_2]
+for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders):
+if isinstance(self, TextualInversionLoaderMixin):
+prompt = self.maybe_convert_prompt(prompt, tokenizer)
+text_inputs = tokenizer(
+prompt,
+padding="max_length",
+max_length=tokenizer.model_max_length,
+truncation=True,
+return_tensors="pt",
+)
+text_input_ids = text_inputs.input_ids
+untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+text_input_ids, untruncated_ids
+):
+removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
+logger.warning(
+"The following part of your input was truncated because CLIP can only handle sequences up to"
+f" {tokenizer.model_max_length} tokens: {removed_text}"
+)
+prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
+pooled_prompt_embeds = prompt_embeds[0]
+if unet_controller is not None and unet_controller.frame_prompt_express is not None:
+if unet_controller.Remove_pool_embeds:
+pooled_prompt_embeds = pooled_prompt_embeds.zero_()
+input_prompt_embeds = prompt_embeds.hidden_states[-2] if clip_skip is None else prompt_embeds.hidden_states[-(clip_skip + 2)]
+alpha_weaken = unet_controller.Alpha_weaken
+beta_weaken = unet_controller.Beta_weaken
+alpha_strengthen = unet_controller.Alpha_enhance
+beta_strengthen = unet_controller.Beta_enhance
+frame_prompt_suppress = unet_controller.frame_prompt_suppress
+frame_prompt_express = unet_controller.frame_prompt_express
+if unet_controller.Prompt_embeds_mode == 'svr':
+for movement in frame_prompt_suppress:
+utils.swr_single_prompt_embeds(movement, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_weaken, beta=beta_weaken)
+utils.swr_single_prompt_embeds(frame_prompt_express, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_strengthen, beta=beta_strengthen)
+elif unet_controller.Prompt_embeds_mode == 'svr-single':
+for movement in frame_prompt_suppress:
+utils.swr_single_prompt_embeds(movement, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_weaken, beta=beta_weaken)
+utils.swr_single_prompt_embeds(frame_prompt_express, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_strengthen, beta=beta_strengthen)
+elif unet_controller.Prompt_embeds_mode == 'svr-eot':
+for movement in frame_prompt_suppress:
+utils.swr_single_prompt_embeds(movement, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_weaken, beta=beta_weaken, zero_eot=True)
+utils.swr_single_prompt_embeds(frame_prompt_express, input_prompt_embeds[0], prompt[0], unet_controller.tokenizer, alpha=alpha_strengthen, beta=beta_strengthen, zero_eot=True)
+elif unet_controller.Prompt_embeds_mode == "original":
+pass
+elif unet_controller.Prompt_embeds_mode == "single":
+pass
+else:
+raise ValueError(f"Invalid prompt embeds mode: {unet_controller.Prompt_embeds_mode}")
+prompt_embeds = input_prompt_embeds
+elif unet_controller is not None and unet_controller.frame_prompt_express_list is not None:
+if unet_controller.Remove_pool_embeds:
+pooled_prompt_embeds = pooled_prompt_embeds.zero_()
+input_prompt_embeds = prompt_embeds.hidden_states[-2] if clip_skip is None else prompt_embeds.hidden_states[-(clip_skip + 2)]
+alpha_weaken = unet_controller.Alpha_weaken
+beta_weaken = unet_controller.Beta_weaken
+alpha_strengthen = unet_controller.Alpha_enhance
+beta_strengthen = unet_controller.Beta_enhance
+frame_prompt_suppress_list = unet_controller.frame_prompt_suppress_list
+frame_prompt_express_list = unet_controller.frame_prompt_express_list
+for index, (frame_prompt_suppress, frame_prompt_express) in enumerate(zip(frame_prompt_suppress_list, frame_prompt_express_list)):
+if unet_controller.Prompt_embeds_mode == 'svr':
+for movement in frame_prompt_suppress:
+utils.swr_single_prompt_embeds(movement, input_prompt_embeds[index], prompt[index], unet_controller.tokenizer, alpha=alpha_weaken, beta=beta_weaken)
+utils.swr_single_prompt_embeds(frame_prompt_express, input_prompt_embeds[index], prompt[index], unet_controller.tokenizer, alpha=alpha_strengthen, beta=beta_strengthen)
+elif unet_controller.Prompt_embeds_mode == 'svr-single':
+for movement in frame_prompt_suppress:
+utils.swr_single_prompt_embeds(movement, input_prompt_embeds[index], prompt[index], unet_controller.tokenizer, alpha=alpha_weaken, beta=beta_weaken)
+utils.swr_single_prompt_embeds(frame_prompt_express, input_prompt_embeds[index], prompt[index], unet_controller.tokenizer, alpha=alpha_strengthen, beta=beta_strengthen)
+elif unet_controller.Prompt_embeds_mode == "original":
+pass
+elif unet_controller.Prompt_embeds_mode == "single":
+pass
+else:
+raise ValueError(f"Invalid prompt embeds mode: {unet_controller.Prompt_embeds_mode}")
+prompt_embeds = input_prompt_embeds
+else:
+if clip_skip is None:
+prompt_embeds = prompt_embeds.hidden_states[-2]
+else:
+prompt_embeds = prompt_embeds.hidden_states[-(clip_skip + 2)]
+prompt_embeds_list.append(prompt_embeds)
+prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+zero_out_negative_prompt = negative_prompt is None and self.config.force_zeros_for_empty_prompt
+if do_classifier_free_guidance and negative_prompt_embeds is None and zero_out_negative_prompt:
+negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+negative_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
+elif do_classifier_free_guidance and negative_prompt_embeds is None:
+negative_prompt = negative_prompt or ""
+negative_prompt_2 = negative_prompt_2 or negative_prompt
+negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+negative_prompt_2 = (
+batch_size * [negative_prompt_2] if isinstance(negative_prompt_2, str) else negative_prompt_2
+)
+uncond_tokens: List[str]
+if prompt is not None and type(prompt) is not type(negative_prompt):
+raise TypeError(
+f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+f" {type(prompt)}."
+)
+elif batch_size != len(negative_prompt):
+raise ValueError(
+f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+" the batch size of `prompt`."
+)
+else:
+uncond_tokens = [negative_prompt, negative_prompt_2]
+negative_prompt_embeds_list = []
+for negative_prompt, tokenizer, text_encoder in zip(uncond_tokens, tokenizers, text_encoders):
+if isinstance(self, TextualInversionLoaderMixin):
+negative_prompt = self.maybe_convert_prompt(negative_prompt, tokenizer)
+max_length = prompt_embeds.shape[1]
+uncond_input = tokenizer(
+negative_prompt,
+padding="max_length",
+max_length=max_length,
+truncation=True,
+return_tensors="pt",
+)
+negative_prompt_embeds = text_encoder(
+uncond_input.input_ids.to(device),
+output_hidden_states=True,
+)
+negative_pooled_prompt_embeds = negative_prompt_embeds[0]
+negative_prompt_embeds = negative_prompt_embeds.hidden_states[-2]
+negative_prompt_embeds_list.append(negative_prompt_embeds)
+negative_prompt_embeds = torch.concat(negative_prompt_embeds_list, dim=-1)
+if self.text_encoder_2 is not None:
+prompt_embeds = prompt_embeds.to(dtype=self.text_encoder_2.dtype, device=device)
+else:
+prompt_embeds = prompt_embeds.to(dtype=self.unet.dtype, device=device)
+bs_embed, seq_len, _ = prompt_embeds.shape
+prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+if do_classifier_free_guidance:
+seq_len = negative_prompt_embeds.shape[1]
+if self.text_encoder_2 is not None:
+negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.text_encoder_2.dtype, device=device)
+else:
+negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.unet.dtype, device=device)
+negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+bs_embed * num_images_per_prompt, -1
+)
+if do_classifier_free_guidance:
+negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+bs_embed * num_images_per_prompt, -1
+)
+if self.text_encoder is not None:
+if isinstance(self, StableDiffusionXLLoraLoaderMixin) and USE_PEFT_BACKEND:
+unscale_lora_layers(self.text_encoder, lora_scale)
+if self.text_encoder_2 is not None:
+if isinstance(self, StableDiffusionXLLoraLoaderMixin) and USE_PEFT_BACKEND:
+unscale_lora_layers(self.text_encoder_2, lora_scale)
+return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+def encode_image(self, image, device, num_images_per_prompt, output_hidden_states=None):
+dtype = next(self.image_encoder.parameters()).dtype
+if not isinstance(image, torch.Tensor):
+image = self.feature_extractor(image, return_tensors="pt").pixel_values
+image = image.to(device=device, dtype=dtype)
+if output_hidden_states:
+image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
+image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
+uncond_image_enc_hidden_states = self.image_encoder(
+torch.zeros_like(image), output_hidden_states=True
+).hidden_states[-2]
+uncond_image_enc_hidden_states = uncond_image_enc_hidden_states.repeat_interleave(
+num_images_per_prompt, dim=0
+)
+return image_enc_hidden_states, uncond_image_enc_hidden_states
+else:
+image_embeds = self.image_encoder(image).image_embeds
+image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+uncond_image_embeds = torch.zeros_like(image_embeds)
+return image_embeds, uncond_image_embeds
+def prepare_ip_adapter_image_embeds(
+self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+):
+if ip_adapter_image_embeds is None:
+if not isinstance(ip_adapter_image, list):
+ip_adapter_image = [ip_adapter_image]
+if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
+raise ValueError(
+f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
+)
+image_embeds = []
+for single_ip_adapter_image, image_proj_layer in zip(
+ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
+):
+output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
+single_image_embeds, single_negative_image_embeds = self.encode_image(
+single_ip_adapter_image, device, 1, output_hidden_state
+)
+single_image_embeds = torch.stack([single_image_embeds] * num_images_per_prompt, dim=0)
+single_negative_image_embeds = torch.stack(
+[single_negative_image_embeds] * num_images_per_prompt, dim=0
+)
+if do_classifier_free_guidance:
+single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
+single_image_embeds = single_image_embeds.to(device)
+image_embeds.append(single_image_embeds)
+else:
+repeat_dims = [1]
+image_embeds = []
+for single_image_embeds in ip_adapter_image_embeds:
+if do_classifier_free_guidance:
+single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
+single_image_embeds = single_image_embeds.repeat(
+num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
+)
+single_negative_image_embeds = single_negative_image_embeds.repeat(
+num_images_per_prompt, *(repeat_dims * len(single_negative_image_embeds.shape[1:]))
+)
+single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
+else:
+single_image_embeds = single_image_embeds.repeat(
+num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
+)
+image_embeds.append(single_image_embeds)
+return image_embeds
+def prepare_extra_step_kwargs(self, generator, eta):
+accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+extra_step_kwargs = {}
+if accepts_eta:
+extra_step_kwargs["eta"] = eta
+accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+if accepts_generator:
+extra_step_kwargs["generator"] = generator
+return extra_step_kwargs
+def check_inputs(
+self,
+prompt,
+prompt_2,
+height,
+width,
+callback_steps,
+negative_prompt=None,
+negative_prompt_2=None,
+prompt_embeds=None,
+negative_prompt_embeds=None,
+pooled_prompt_embeds=None,
+negative_pooled_prompt_embeds=None,
+ip_adapter_image=None,
+ip_adapter_image_embeds=None,
+callback_on_step_end_tensor_inputs=None,
+):
+if height % 8 != 0 or width % 8 != 0:
+raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+if callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0):
+raise ValueError(
+f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
+f" {type(callback_steps)}."
+)
+if callback_on_step_end_tensor_inputs is not None and not all(
+k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+):
+raise ValueError(
+f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+)
+if prompt is not None and prompt_embeds is not None:
+raise ValueError(
+f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+" only forward one of the two."
+)
+elif prompt_2 is not None and prompt_embeds is not None:
+raise ValueError(
+f"Cannot forward both `prompt_2`: {prompt_2} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+" only forward one of the two."
+)
+elif prompt is None and prompt_embeds is None:
+raise ValueError(
+"Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+)
+elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+elif prompt_2 is not None and (not isinstance(prompt_2, str) and not isinstance(prompt_2, list)):
+raise ValueError(f"`prompt_2` has to be of type `str` or `list` but is {type(prompt_2)}")
+if negative_prompt is not None and negative_prompt_embeds is not None:
+raise ValueError(
+f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`:"
+f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+)
+elif negative_prompt_2 is not None and negative_prompt_embeds is not None:
+raise ValueError(
+f"Cannot forward both `negative_prompt_2`: {negative_prompt_2} and `negative_prompt_embeds`:"
+f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+)
+if prompt_embeds is not None and negative_prompt_embeds is not None:
+if prompt_embeds.shape != negative_prompt_embeds.shape:
+raise ValueError(
+"`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
+f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
+f" {negative_prompt_embeds.shape}."
+)
+if prompt_embeds is not None and pooled_prompt_embeds is None:
+raise ValueError(
+"If `prompt_embeds` are provided, `pooled_prompt_embeds` also have to be passed. Make sure to generate `pooled_prompt_embeds` from the same text encoder that was used to generate `prompt_embeds`."
+)
+if negative_prompt_embeds is not None and negative_pooled_prompt_embeds is None:
+raise ValueError(
+"If `negative_prompt_embeds` are provided, `negative_pooled_prompt_embeds` also have to be passed. Make sure to generate `negative_pooled_prompt_embeds` from the same text encoder that was used to generate `negative_prompt_embeds`."
+)
+if ip_adapter_image is not None and ip_adapter_image_embeds is not None:
+raise ValueError(
+"Provide either `ip_adapter_image` or `ip_adapter_image_embeds`. Cannot leave both `ip_adapter_image` and `ip_adapter_image_embeds` defined."
+)
+if ip_adapter_image_embeds is not None:
+if not isinstance(ip_adapter_image_embeds, list):
+raise ValueError(
+f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}"
+)
+elif ip_adapter_image_embeds[0].ndim not in [3, 4]:
+raise ValueError(
+f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
+)
+def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None, same=False):
+shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+if isinstance(generator, list) and len(generator) != batch_size:
+raise ValueError(
+f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+)
+if latents is None:
+latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+if same:
+latents_pivot = latents[0]
+for index in range(shape[0] - 1):
+latents[index+1] = latents_pivot
+else:
+latents = latents.to(device)
+latents = latents * self.scheduler.init_noise_sigma
+return latents
+def _get_add_time_ids(
+self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
+):
+add_time_ids = list(original_size + crops_coords_top_left + target_size)
+passed_add_embed_dim = (
+self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+)
+expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
+if expected_add_embed_dim != passed_add_embed_dim:
+raise ValueError(
+f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+)
+add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+return add_time_ids
+def upcast_vae(self):
+dtype = self.vae.dtype
+self.vae.to(dtype=torch.float32)
+use_torch_2_0_or_xformers = isinstance(
+self.vae.decoder.mid_block.attentions[0].processor,
+(
+AttnProcessor2_0,
+XFormersAttnProcessor,
+LoRAXFormersAttnProcessor,
+LoRAAttnProcessor2_0,
+FusedAttnProcessor2_0,
+),
+)
+if use_torch_2_0_or_xformers:
+self.vae.post_quant_conv.to(dtype)
+self.vae.decoder.conv_in.to(dtype)
+self.vae.decoder.mid_block.to(dtype)
+def get_guidance_scale_embedding(self, w, embedding_dim=512, dtype=torch.float32):
+assert len(w.shape) == 1
+w = w * 1000.0
+half_dim = embedding_dim // 2
+emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
+emb = w.to(dtype)[:, None] * emb[None, :]
+emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+if embedding_dim % 2 == 1:
+emb = torch.nn.functional.pad(emb, (0, 1))
+assert emb.shape == (w.shape[0], embedding_dim)
+return emb
+@property
+def guidance_scale(self):
+return self._guidance_scale
+@property
+def guidance_rescale(self):
+return self._guidance_rescale
+@property
+def clip_skip(self):
+return self._clip_skip
+@property
+def do_classifier_free_guidance(self):
+return self._guidance_scale > 1 and self.unet.config.time_cond_proj_dim is None
+@property
+def cross_attention_kwargs(self):
+return self._cross_attention_kwargs
+@property
+def denoising_end(self):
+return self._denoising_end
+@property
+def num_timesteps(self):
+return self._num_timesteps
+@property
+def interrupt(self):
+return self._interrupt
+@torch.no_grad()
+@replace_example_docstring(EXAMPLE_DOC_STRING)
+def __call__(
+self,
+prompt: Union[str, List[str]] = None,
+prompt_2: Optional[Union[str, List[str]]] = None,
+height: Optional[int] = None,
+width: Optional[int] = None,
+num_inference_steps: int = 50,
+timesteps: List[int] = None,
+denoising_end: Optional[float] = None,
+guidance_scale: float = 5.0,
+negative_prompt: Optional[Union[str, List[str]]] = None,
+negative_prompt_2: Optional[Union[str, List[str]]] = None,
+num_images_per_prompt: Optional[int] = 1,
+eta: float = 0.0,
+generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+latents: Optional[torch.FloatTensor] = None,
+prompt_embeds: Optional[torch.FloatTensor] = None,
+negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+ip_adapter_image: Optional[PipelineImageInput] = None,
+ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
+output_type: Optional[str] = "pil",
+return_dict: bool = True,
+cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+guidance_rescale: float = 0.0,
+original_size: Optional[Tuple[int, int]] = None,
+crops_coords_top_left: Tuple[int, int] = (0, 0),
+target_size: Optional[Tuple[int, int]] = None,
+negative_original_size: Optional[Tuple[int, int]] = None,
+negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
+negative_target_size: Optional[Tuple[int, int]] = None,
+clip_skip: Optional[int] = None,
+callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+unet_controller: Optional[UNetController] = None,
+**kwargs,
+):
+r
+callback = kwargs.pop("callback", None)
+callback_steps = kwargs.pop("callback_steps", None)
+if callback is not None:
+deprecate(
+"callback",
+"1.0.0",
+"Passing `callback` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+)
+if callback_steps is not None:
+deprecate(
+"callback_steps",
+"1.0.0",
+"Passing `callback_steps` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+)
+height = height or self.default_sample_size * self.vae_scale_factor
+width = width or self.default_sample_size * self.vae_scale_factor
+original_size = original_size or (height, width)
+target_size = target_size or (height, width)
+self.check_inputs(
+prompt,
+prompt_2,
+height,
+width,
+callback_steps,
+negative_prompt,
+negative_prompt_2,
+prompt_embeds,
+negative_prompt_embeds,
+pooled_prompt_embeds,
+negative_pooled_prompt_embeds,
+ip_adapter_image,
+ip_adapter_image_embeds,
+callback_on_step_end_tensor_inputs,
+)
+self._guidance_scale = guidance_scale
+self._guidance_rescale = guidance_rescale
+self._clip_skip = clip_skip
+self._cross_attention_kwargs = cross_attention_kwargs
+self._denoising_end = denoising_end
+self._interrupt = False
+if unet_controller is not None:
+if prompt_2 is not None or negative_prompt_2 is not None:
+exit("current not support prompt_2 and negatvie_prompt_2")
+unet_controller.do_classifier_free_guidance = self.do_classifier_free_guidance
+if not isinstance(prompt, list):
+prompt_ = [prompt]
+else:
+prompt_ = prompt
+if not isinstance(negative_prompt, list):
+negative_prompt_ = [negative_prompt]
+else:
+negative_prompt_ = negative_prompt
+unet_controller.prompts = prompt_
+unet_controller.negative_prompt = negative_prompt_
+if prompt is not None and isinstance(prompt, str):
+batch_size = 1
+elif prompt is not None and isinstance(prompt, list):
+batch_size = len(prompt)
+else:
+batch_size = prompt_embeds.shape[0]
+device = self._execution_device
+lora_scale = (
+self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
+)
+(
+prompt_embeds,
+negative_prompt_embeds,
+pooled_prompt_embeds,
+negative_pooled_prompt_embeds,
+) = self.encode_prompt(
+prompt=prompt,
+prompt_2=prompt_2,
+device=device,
+num_images_per_prompt=num_images_per_prompt,
+do_classifier_free_guidance=self.do_classifier_free_guidance,
+negative_prompt=negative_prompt,
+negative_prompt_2=negative_prompt_2,
+prompt_embeds=prompt_embeds,
+negative_prompt_embeds=negative_prompt_embeds,
+pooled_prompt_embeds=pooled_prompt_embeds,
+negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+lora_scale=lora_scale,
+clip_skip=self.clip_skip,
+unet_controller=unet_controller,
+)
+timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+num_channels_latents = self.unet.config.in_channels
+latents = self.prepare_latents(
+batch_size * num_images_per_prompt,
+num_channels_latents,
+height,
+width,
+prompt_embeds.dtype,
+device,
+generator,
+latents,
+same=(unet_controller.Use_same_latents if unet_controller is not None else False)
+)
+extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+add_text_embeds = pooled_prompt_embeds
+if self.text_encoder_2 is None:
+text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+else:
+text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
+add_time_ids = self._get_add_time_ids(
+original_size,
+crops_coords_top_left,
+target_size,
+dtype=prompt_embeds.dtype,
+text_encoder_projection_dim=text_encoder_projection_dim,
+)
+if negative_original_size is not None and negative_target_size is not None:
+negative_add_time_ids = self._get_add_time_ids(
+negative_original_size,
+negative_crops_coords_top_left,
+negative_target_size,
+dtype=prompt_embeds.dtype,
+text_encoder_projection_dim=text_encoder_projection_dim,
+)
+else:
+negative_add_time_ids = add_time_ids
+if self.do_classifier_free_guidance:
+prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+prompt_embeds = prompt_embeds.to(device)
+add_text_embeds = add_text_embeds.to(device)
+add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+image_embeds = self.prepare_ip_adapter_image_embeds(
+ip_adapter_image,
+ip_adapter_image_embeds,
+device,
+batch_size * num_images_per_prompt,
+self.do_classifier_free_guidance,
+)
+num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+if (
+self.denoising_end is not None
+and isinstance(self.denoising_end, float)
+and self.denoising_end > 0
+and self.denoising_end < 1
+):
+discrete_timestep_cutoff = int(
+round(
+self.scheduler.config.num_train_timesteps
+- (self.denoising_end * self.scheduler.config.num_train_timesteps)
+)
+)
+num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
+timesteps = timesteps[:num_inference_steps]
+timestep_cond = None
+if self.unet.config.time_cond_proj_dim is not None:
+guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
+timestep_cond = self.get_guidance_scale_embedding(
+guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+).to(device=device, dtype=latents.dtype)
+self._num_timesteps = len(timesteps)
+if unet_controller is not None and unet_controller.Use_clip_guidance:
+clip_prompt = prompt if isinstance(prompt, str) else (prompt[0] if isinstance(prompt, list) and len(prompt) > 0 else "")
+if prompt_2 is not None:
+clip_prompt_2 = prompt_2 if isinstance(prompt_2, str) else (prompt_2[0] if isinstance(prompt_2, list) and len(prompt_2) > 0 else "")
+clip_prompt = f"{clip_prompt}, {clip_prompt_2}"
+unet_controller.init_clip_model(clip_prompt)
+unet_controller.device = device
+with self.progress_bar(total=num_inference_steps) as progress_bar:
+for i, t in enumerate(timesteps):
+if self.interrupt:
+continue
+if unet_controller is not None:
+unet_controller.current_time_step = i
+latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+added_cond_kwargs["image_embeds"] = image_embeds
+noise_pred = self.unet(
+latent_model_input,
+t,
+encoder_hidden_states=prompt_embeds,
+timestep_cond=timestep_cond,
+cross_attention_kwargs=self.cross_attention_kwargs,
+added_cond_kwargs=added_cond_kwargs,
+unet_controller=unet_controller,
+return_dict=False,
+)[0]
+if self.do_classifier_free_guidance:
+noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+if unet_controller is not None and unet_controller.Use_clip_guidance:
+latents = latents.detach()
+latents = unet_controller.apply_clip_guidance(latents, self.vae, i, t, num_inference_steps)
+if unet_controller is not None:
+unet_controller.aggregate_step_attn()
+if callback_on_step_end is not None:
+callback_kwargs = {}
+for k in callback_on_step_end_tensor_inputs:
+callback_kwargs[k] = locals()[k]
+callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+latents = callback_outputs.pop("latents", latents)
+prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
+negative_pooled_prompt_embeds = callback_outputs.pop(
+"negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
+)
+add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
+negative_add_time_ids = callback_outputs.pop("negative_add_time_ids", negative_add_time_ids)
+if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+progress_bar.update()
+if callback is not None and i % callback_steps == 0:
+step_idx = i // getattr(self.scheduler, "order", 1)
+callback(step_idx, t, latents)
+if not output_type == "latent":
+needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+if needs_upcasting:
+self.upcast_vae()
+latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+has_latents_mean = hasattr(self.vae.config, "latents_mean") and self.vae.config.latents_mean is not None
+has_latents_std = hasattr(self.vae.config, "latents_std") and self.vae.config.latents_std is not None
+if has_latents_mean and has_latents_std:
+latents_mean = (
+torch.tensor(self.vae.config.latents_mean).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+)
+latents_std = (
+torch.tensor(self.vae.config.latents_std).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+)
+latents = latents * latents_std / self.vae.config.scaling_factor + latents_mean
+else:
+latents = latents / self.vae.config.scaling_factor
+image = self.vae.decode(latents, return_dict=False)[0]
+if needs_upcasting:
+self.vae.to(dtype=torch.float16)
+else:
+image = latents
+if not output_type == "latent":
+if self.watermark is not None:
+image = self.watermark.apply_watermark(image)
+image = self.image_processor.postprocess(image, output_type=output_type)
+self.maybe_free_model_hooks()
+if not return_dict:
+return (image,)
+return StableDiffusionXLPipelineOutput(images=image)
+from asyncio import FastChildWatcher
+import torch
+import copy
+import os
+from typing import List, Dict, Optional
+class UNetController():
+Is_freeu_enabled = False
+Freeu_parm = {'s1': 0.6, 's2': 0.4, 'b1': 1.1, 'b2': 1.2}
+Use_ipca = False
+Ipca_position = ['down0', 'down1', 'down2', 'mid', 'up0', 'up1', 'up2']
+Ipca_start_step = 0
+Ipca_dropout = 0.0
+Use_embeds_mask = True
+Alpha_weaken = 0.01
+Beta_weaken = 0.05
+Alpha_enhance = -0.01
+Beta_enhance = 1.0
+Prompt_embeds_mode = 'original'
+Remove_pool_embeds = False
+Prompt_embeds_start_step = 0
+Store_qkv = True
+Use_same_latents = True
+Use_same_init_noise = True
+Save_story_image = True
+Use_kv_interpolation = False
+Kv_interpolation_alpha = 0.6
+Kv_interpolation_position = ['down','up']
+Kv_interpolation_start_step = 20
+Kv_interpolation_end_step = 35
+Use_kv_concat = False
+Kv_concat_sampling_rate = 0.2
+Kv_concat_position = ['up']
+Kv_concat_start_step = 0
+Kv_concat_end_step = 20
+Visualize_attn_map = False
+Use_mask_modulation = False
+Mask_coords = [0.3, 0.7, 0.8, 0.3]
+Mask_modulation_reg = 10.0
+Mask_modulation_part = 0.3
+Visualize_modulation_scores = False
+Modulation_scores_vis_positions = ['up1']
+Modulation_scores_vis_layer_indices = [2]
+Use_clip_guidance = False
+Clip_guidance_lambda = 10.0
+Clip_guidance_eta = 0.5
+Clip_guidance_interval = 10
+Use_id_replacement = True
+Id_replacement_position = ['down', 'mid', 'up']
+Id_replacement_start_step = 0
+Id_replacement_end_step = 1000
+def __init__(self):
+self._variables = {}
+self.device = "cuda"
+self.current_unet_position = 'down'
+self.torch_dtype = torch.float16
+self.prompts = None
+self.negative_prompt = None
+self.id_prompt = None
+self.subject_text = None
+self.frame_prompt_express = None
+self.frame_prompt_suppress = None
+self.frame_prompt_express_list = None
+self.frame_prompt_suppress_list = None
+self.tokenizer = None
+self.result_save_dir = None
+self.current_time_step = None
+self.do_classifier_free_guidance = None
+self.q_store = {}
+self.k_store = {}
+self.v_store = {}
+self.all_frames_k_store = {}
+self.all_frames_v_store = {}
+self.current_frame_index = 0
+self.do_classifier_free_guidance = None
+self.current_unet_position = None
+self.current_attn_idx_in_block = 2
+self.ipca2_index = -1
+self.ipca_time_step = -1
+self.clip_model = None
+self.clip_processor = None
+self.clip_text_embeds = None
+self.first_frame_id_embeds = None
+self.first_frame_id_norm = None
+self.id_prompt_token_indices = None
+self.save_self_attention = False
+self.attn_store_disk = False
+self.attn_store_dir = "./unet_attn_cache"
+self.cur_denoise_step = 0
+self.step_attn_store = self._get_empty_attn_store()
+self.total_attn_store = {}
+self.all_step_attn_paths = []
+self.is_start_frame = True
+self.attn_map_store = {}
+self.attn_count = 0
+self.max_attn_resolution = 32
+self.use_half_precision = True
+self.max_heads_to_save = 4
+if self.attn_store_disk:
+import datetime
+time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+self.attn_store_dir = f"./unet_attn_cache_{time_str}"
+os.makedirs(self.attn_store_dir, exist_ok=True)
+self.modulation_scores_store = {}
+def _get_empty_attn_store(self) -> Dict[str, List[torch.Tensor]]:
+return {
+"down_cross": [], "mid_cross": [], "up_cross": [],
+"down_self": [], "mid_self": [], "up_self": []
+}
+def reset_attn_store(self, clear_modulation_scores=True):
+self.cur_denoise_step = 0
+self.attn_count = 0
+self.step_attn_store = self._get_empty_attn_store()
+self.total_attn_store = {}
+self.all_step_attn_paths = []
+if clear_modulation_scores:
+self.modulation_scores_store = {}
+def save_attn_map(self, attn_weights: torch.Tensor, is_cross: bool, place_in_unet: str):
+if place_in_unet.startswith("down"):
+place_prefix = "down"
+elif place_in_unet.startswith("up"):
+place_prefix = "up"
+elif place_in_unet.startswith("mid"):
+place_prefix = "mid"
+else:
+place_prefix = place_in_unet
+attn_key = f"{place_prefix}_{'cross' if is_cross else 'self'}"
+if attn_key not in self.step_attn_store:
+self.step_attn_store[attn_key] = []
+max_seq_len = self.max_attn_resolution ** 2
+if attn_weights.shape[-2] <= max_seq_len:
+if is_cross or (not is_cross and self.save_self_attention):
+save_tensor = attn_weights.detach().cpu()
+if save_tensor.dim() == 4:
+save_tensor = save_tensor.mean(dim=(0, 1))
+if is_cross and save_tensor.shape[0] == max_seq_len:
+spatial_size = int(save_tensor.shape[0] ** 0.5)
+if spatial_size * spatial_size == save_tensor.shape[0]:
+save_tensor = save_tensor.view(spatial_size, spatial_size, -1)
+elif not is_cross and save_tensor.shape[0] == max_seq_len and save_tensor.shape[1] == max_seq_len:
+pass
+elif save_tensor.dim() == 3:
+save_tensor = save_tensor.mean(dim=0)
+if is_cross and save_tensor.shape[0] == max_seq_len:
+spatial_size = int(save_tensor.shape[0] ** 0.5)
+if spatial_size * spatial_size == save_tensor.shape[0]:
+save_tensor = save_tensor.view(spatial_size, spatial_size, -1)
+if self.use_half_precision:
+save_tensor = save_tensor.half()
+self.step_attn_store[attn_key].append(save_tensor.clone())
+self.attn_count += 1
+def aggregate_step_attn(self):
+if len(self.total_attn_store) == 0:
+self.total_attn_store = {}
+for key, value_list in self.step_attn_store.items():
+self.total_attn_store[key] = [t.clone() for t in value_list]
+else:
+for key in self.total_attn_store.keys():
+if key in self.step_attn_store:
+for i in range(min(len(self.total_attn_store[key]), len(self.step_attn_store[key]))):
+self.total_attn_store[key][i] = self.total_attn_store[key][i] + self.step_attn_store[key][i]
+if self.attn_store_disk:
+step_save_path = os.path.join(self.attn_store_dir, f"denoise_step_{self.cur_denoise_step:03d}.pt")
+step_data = {k: [t.clone() for t in v] for k, v in self.step_attn_store.items()}
+torch.save(step_data, step_save_path)
+self.all_step_attn_paths.append(step_save_path)
+del step_data
+for key in list(self.step_attn_store.keys()):
+self.step_attn_store[key].clear()
+self.step_attn_store = self._get_empty_attn_store()
+self.cur_denoise_step += 1
+if self.cur_denoise_step % 10 == 0:
+import gc
+gc.collect()
+def get_average_attn(self) -> Dict[str, List[torch.Tensor]]:
+if self.cur_denoise_step == 0:
+return copy.deepcopy(self.total_attn_store)
+average_attn = {}
+for key in self.total_attn_store.keys():
+average_attn[key] = [
+item / self.cur_denoise_step for item in self.total_attn_store[key]
+]
+return average_attn
+def save_frame_kv(self, k: torch.Tensor, v: torch.Tensor, timestep: int, unet_position: str, layer_idx: int = 0):
+frame_index = self.current_frame_index
+if frame_index not in self.all_frames_k_store:
+self.all_frames_k_store[frame_index] = {}
+self.all_frames_v_store[frame_index] = {}
+if timestep not in self.all_frames_k_store[frame_index]:
+self.all_frames_k_store[frame_index][timestep] = {}
+self.all_frames_v_store[frame_index][timestep] = {}
+if unet_position not in self.all_frames_k_store[frame_index][timestep]:
+self.all_frames_k_store[frame_index][timestep][unet_position] = {}
+self.all_frames_v_store[frame_index][timestep][unet_position] = {}
+self.all_frames_k_store[frame_index][timestep][unet_position][layer_idx] = k.detach().cpu()
+self.all_frames_v_store[frame_index][timestep][unet_position][layer_idx] = v.detach().cpu()
+def save_first_frame_kv(self, k: torch.Tensor, v: torch.Tensor, timestep: int, unet_position: str, layer_idx: int = 0):
+self.save_frame_kv(k, v, timestep, unet_position, layer_idx)
+def get_first_frame_kv(self, timestep: int, unet_position: str, layer_idx: int = 0):
+frame_index = 0
+if (frame_index in self.all_frames_k_store and
+timestep in self.all_frames_k_store[frame_index] and
+unet_position in self.all_frames_k_store[frame_index][timestep] and
+layer_idx in self.all_frames_k_store[frame_index][timestep][unet_position]):
+k = self.all_frames_k_store[frame_index][timestep][unet_position][layer_idx]
+v = self.all_frames_v_store[frame_index][timestep][unet_position][layer_idx]
+return k.to(self.device), v.to(self.device)
+return None, None
+def get_previous_frames_kv(self, q: torch.Tensor, timestep: int, unet_position: str, layer_idx: int = 0,
+sampling_rate: float = 0.6, scale: float = 1.0):
+current_frame = self.current_frame_index
+if current_frame == 0:
+return None, None
+all_previous_k_list = []
+all_previous_v_list = []
+for prev_frame_idx in range(current_frame):
+if (prev_frame_idx in self.all_frames_k_store and
+timestep in self.all_frames_k_store[prev_frame_idx] and
+unet_position in self.all_frames_k_store[prev_frame_idx][timestep] and
+layer_idx in self.all_frames_k_store[prev_frame_idx][timestep][unet_position]):
+prev_k = self.all_frames_k_store[prev_frame_idx][timestep][unet_position][layer_idx]
+prev_v = self.all_frames_v_store[prev_frame_idx][timestep][unet_position][layer_idx]
+prev_k = prev_k.to(q.device).to(q.dtype)
+prev_v = prev_v.to(q.device).to(q.dtype)
+scores = torch.matmul(q, prev_k.transpose(-2, -1)) * scale
+importance_scores = scores.mean(dim=2)
+head_importance = importance_scores.mean(dim=0)
+seq_len_prev = prev_k.shape[2]
+num_samples = max(1, int(seq_len_prev * sampling_rate))
+global_importance = head_importance.mean(dim=0)
+top_k_values, top_k_indices = torch.topk(global_importance, k=num_samples, dim=-1)
+sampled_k = prev_k[:, :, top_k_indices, :]
+sampled_v = prev_v[:, :, top_k_indices, :]
+all_previous_k_list.append(sampled_k)
+all_previous_v_list.append(sampled_v)
+if len(all_previous_k_list) == 0:
+return None, None
+merged_k = torch.cat(all_previous_k_list, dim=2)
+merged_v = torch.cat(all_previous_v_list, dim=2)
+return merged_k, merged_v
+def reset_first_frame_kv(self):
+self.all_frames_k_store = {}
+self.all_frames_v_store = {}
+self.reset_first_frame_id_embeds()
+def save_first_frame_id_embeds(self, encoder_hidden_states: torch.Tensor):
+if not self.Use_id_replacement:
+return
+if self.id_prompt is None or self.tokenizer is None or self.prompts is None or len(self.prompts) == 0:
+return
+try:
+import unet.utils as utils
+prompt_tokens = utils.prompt2tokens(self.tokenizer, self.prompts[0])
+id_prompt_tokens = utils.prompt2tokens(self.tokenizer, self.id_prompt)
+id_prompt_tokens = [word for word in id_prompt_tokens if word != '<|endoftext|>' and word != '<|startoftext|>']
+start_idx = utils.find_sublist_index(prompt_tokens, id_prompt_tokens)
+if start_idx == -1:
+if len(id_prompt_tokens) > 0 and prompt_tokens[:len(id_prompt_tokens)] == id_prompt_tokens:
+start_idx = 0
+else:
+return
+end_idx = start_idx + len(id_prompt_tokens)
+self.id_prompt_token_indices = (start_idx, end_idx)
+if self.do_classifier_free_guidance and encoder_hidden_states.shape[0] >= 2:
+positive_embeds = encoder_hidden_states[encoder_hidden_states.shape[0] // 2:]
+id_embeds = positive_embeds[:, start_idx:end_idx, :].detach().clone()
+self.first_frame_id_embeds = id_embeds
+self.first_frame_id_norm = torch.norm(id_embeds.view(-1)).item()
+else:
+id_embeds = encoder_hidden_states[:, start_idx:end_idx, :].detach().clone()
+self.first_frame_id_embeds = id_embeds
+self.first_frame_id_norm = torch.norm(id_embeds.view(-1)).item()
+except Exception as e:
+print(f"警告: 保存第一张图像的id_prompt embedding失败: {e}")
+self.first_frame_id_embeds = None
+self.first_frame_id_norm = None
+self.id_prompt_token_indices = None
+def get_first_frame_id_embeds(self) -> Optional[torch.Tensor]:
+if not self.Use_id_replacement:
+return None
+if self.first_frame_id_embeds is None or self.id_prompt_token_indices is None:
+return None
+return self.first_frame_id_embeds
+def get_first_frame_id_norm(self) -> Optional[float]:
+if not self.Use_id_replacement:
+return None
+return self.first_frame_id_norm
+def reset_first_frame_id_embeds(self):
+self.first_frame_id_embeds = None
+self.first_frame_id_norm = None
+self.id_prompt_token_indices = None
+def init_clip_model(self, prompt):
+if not self.Use_clip_guidance:
+return
+try:
+import clip
+self.clip_model, self.clip_preprocess = clip.load('ViT-B/32', device=self.device, jit=False)
+self.clip_model.eval()
+text_tokens = clip.tokenize([prompt], truncate=True).to(self.device)
+with torch.no_grad():
+self.clip_text_embeds = self.clip_model.encode_text(text_tokens)
+self.clip_text_embeds = self.clip_text_embeds / self.clip_text_embeds.norm(dim=-1, keepdim=True)
+except ImportError:
+print("警告: clip 库未安装，CLIP 引导功能将被禁用。请运行: pip install clip-by-openai")
+self.Use_clip_guidance = False
+except Exception as e:
+print(f"警告: CLIP 模型初始化失败: {e}")
+self.Use_clip_guidance = False
+def apply_clip_guidance(self, latents, vae, timestep_index, timestep, num_inference_steps):
+if not self.Use_clip_guidance:
+return latents
+if self.Clip_guidance_eta == 0:
+return latents
+if (timestep_index + 1) % self.Clip_guidance_interval != 0:
+return latents
+if self.clip_text_embeds is None or self.clip_model is None:
+return latents
+try:
+original_latents = latents.clone().detach()
+if torch.isnan(latents).any() or torch.isinf(latents).any():
+print(f"警告: 输入 latents 包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+latents_requires_grad = latents.detach().requires_grad_(True)
+with torch.enable_grad():
+has_latents_mean = hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None
+has_latents_std = hasattr(vae.config, "latents_std") and vae.config.latents_std is not None
+if has_latents_mean and has_latents_std:
+scaling_factor = vae.config.scaling_factor
+latents_mean = torch.tensor(vae.config.latents_mean, device=latents_requires_grad.device, dtype=latents_requires_grad.dtype).view(1, 4, 1, 1)
+latents_std = torch.tensor(vae.config.latents_std, device=latents_requires_grad.device, dtype=latents_requires_grad.dtype).view(1, 4, 1, 1)
+scaled_latents = latents_requires_grad * latents_std / scaling_factor + latents_mean
+grad_scale = latents_std / scaling_factor
+else:
+scaling_factor = vae.config.scaling_factor if hasattr(vae.config, 'scaling_factor') else 0.18215
+scaled_latents = latents_requires_grad / scaling_factor
+grad_scale = 1.0 / scaling_factor
+if torch.isnan(scaled_latents).any() or torch.isinf(scaled_latents).any():
+print(f"警告: scaled_latents 包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+scaled_latents_clamped = torch.clamp(scaled_latents, -20.0, 20.0)
+if torch.isnan(scaled_latents_clamped).any() or torch.isinf(scaled_latents_clamped).any():
+print(f"警告: clamped scaled_latents 包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+needs_upcasting = vae.dtype == torch.float16 and hasattr(vae.config, "force_upcast") and vae.config.force_upcast
+original_vae_dtype = vae.dtype
+if needs_upcasting:
+vae.to(dtype=torch.float32)
+use_torch_2_0_or_xformers = hasattr(vae, 'decoder') and hasattr(vae.decoder, 'mid_block')
+if use_torch_2_0_or_xformers:
+if hasattr(vae, 'post_quant_conv'):
+vae.post_quant_conv.to(dtype=torch.float32)
+if hasattr(vae.decoder, 'conv_in'):
+vae.decoder.conv_in.to(dtype=torch.float32)
+if hasattr(vae.decoder, 'mid_block'):
+vae.decoder.mid_block.to(dtype=torch.float32)
+else:
+vae.to(dtype=torch.float32)
+vae_dtype = next(iter(vae.post_quant_conv.parameters())).dtype
+scaled_latents_fp32 = scaled_latents_clamped.to(dtype=vae_dtype)
+if torch.isnan(scaled_latents_fp32).any() or torch.isinf(scaled_latents_fp32).any():
+print(f"警告: scaled_latents_fp32 包含 NaN 或 Inf，跳过 CLIP 引导")
+if needs_upcasting:
+vae.to(dtype=original_vae_dtype)
+return original_latents
+try:
+decoded_image = vae.decode(scaled_latents_fp32, return_dict=False)[0]
+except RuntimeError as e:
+print(f"警告: VAE 解码失败: {e}，跳过 CLIP 引导")
+if needs_upcasting:
+vae.to(dtype=original_vae_dtype)
+return original_latents
+finally:
+if needs_upcasting:
+vae.to(dtype=original_vae_dtype)
+if torch.isnan(decoded_image).any() or torch.isinf(decoded_image).any():
+nan_count = torch.isnan(decoded_image).sum().item()
+inf_count = torch.isinf(decoded_image).sum().item()
+print(f"警告: VAE 解码结果包含 NaN ({nan_count} 个) 或 Inf ({inf_count} 个)，跳过 CLIP 引导 (timestep={timestep_index}, latents_range=[{scaled_latents_clamped.min().item():.2f}, {scaled_latents_clamped.max().item():.2f}])")
+return original_latents
+decoded_image = (decoded_image + 1.0) / 2.0
+decoded_image = torch.clamp(decoded_image, 0.0, 1.0)
+from torch.nn.functional import interpolate
+_, _, h, w = decoded_image.shape
+if h < 224 or w < 224:
+scale = max(224 / h, 224 / w)
+new_h, new_w = int(h * scale), int(w * scale)
+decoded_image = interpolate(decoded_image, size=(new_h, new_w), mode='bilinear', align_corners=False)
+_, _, h, w = decoded_image.shape
+top = (h - 224) // 2
+left = (w - 224) // 2
+decoded_image = decoded_image[:, :, top:top+224, left:left+224]
+mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=decoded_image.device, dtype=decoded_image.dtype).view(1, 3, 1, 1)
+std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=decoded_image.device, dtype=decoded_image.dtype).view(1, 3, 1, 1)
+decoded_image_normalized = (decoded_image - mean) / std
+if torch.isnan(decoded_image_normalized).any() or torch.isinf(decoded_image_normalized).any():
+print(f"警告: 归一化后的图像包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+image_embeds = self.clip_model.encode_image(decoded_image_normalized)
+if torch.isnan(image_embeds).any() or torch.isinf(image_embeds).any():
+print(f"警告: CLIP 编码结果包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+image_embeds_norm = image_embeds.norm(dim=-1, keepdim=True)
+eps = 1e-8
+image_embeds = image_embeds / torch.clamp(image_embeds_norm, min=eps)
+if torch.isnan(image_embeds).any() or torch.isinf(image_embeds).any():
+print(f"警告: 归一化后的 image_embeds 包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+cosine_sim = (image_embeds * self.clip_text_embeds).sum(dim=-1).mean()
+if torch.isnan(cosine_sim) or torch.isinf(cosine_sim):
+print(f"警告: cosine_sim 为 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+clip_loss = -self.Clip_guidance_lambda * cosine_sim
+if torch.isnan(clip_loss) or torch.isinf(clip_loss):
+print(f"警告: clip_loss 为 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+try:
+grad_scaled = torch.autograd.grad(
+clip_loss,
+scaled_latents,
+retain_graph=False,
+create_graph=False,
+allow_unused=False
+)[0]
+except RuntimeError as e:
+print(f"警告: 梯度计算失败: {e}，跳过 CLIP 引导")
+return original_latents
+if grad_scaled is None:
+print(f"警告: 梯度为 None，跳过 CLIP 引导")
+return original_latents
+if torch.isnan(grad_scaled).any() or torch.isinf(grad_scaled).any():
+nan_count = torch.isnan(grad_scaled).sum().item()
+inf_count = torch.isinf(grad_scaled).sum().item()
+print(f"警告: CLIP 引导梯度包含 NaN ({nan_count} 个) 或 Inf ({inf_count} 个)，跳过此步骤 (timestep={timestep_index})")
+return original_latents
+if has_latents_mean and has_latents_std:
+grad = grad_scaled * grad_scale
+else:
+grad = grad_scaled * grad_scale
+if torch.isnan(grad).any() or torch.isinf(grad).any():
+print(f"警告: 缩放后的梯度包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1, keepdim=True).view(-1, 1, 1, 1)
+if torch.isnan(grad_norm).any() or torch.isinf(grad_norm).any():
+print(f"警告: 梯度范数包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+max_grad_norm = 1.0
+eps = 1e-8
+grad_normalized = grad / torch.clamp(grad_norm / max_grad_norm, min=1.0)
+if torch.isnan(grad_normalized).any() or torch.isinf(grad_normalized).any():
+print(f"警告: 归一化后的梯度包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+grad = torch.clamp(grad_normalized, -0.5, 0.5)
+if torch.isnan(grad).any() or torch.isinf(grad).any():
+print(f"警告: 裁剪后的梯度包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+safe_eta = min(self.Clip_guidance_eta, 0.1)
+latents_updated = original_latents - safe_eta * grad
+if torch.isnan(latents_updated).any() or torch.isinf(latents_updated).any():
+print(f"警告: 更新后的 latents 包含 NaN 或 Inf，跳过 CLIP 引导")
+return original_latents
+latents_updated = torch.clamp(latents_updated, -5.0, 5.0)
+if torch.isnan(latents_updated).any() or torch.isinf(latents_updated).any():
+print(f"警告: 最终 latents 包含 NaN 或 Inf，返回原始 latents")
+return original_latents
+return latents_updated.detach()
+except Exception as e:
+print(f"警告: CLIP 引导应用失败: {e}")
+import traceback
+traceback.print_exc()
+return original_latents if 'original_latents' in locals() else latents
+return latents
+def print_attributes(self):
+for attr, value in vars(self).items():
+print(f"{attr}: {value}")
+import torch
+from typing import Optional
+from PIL import Image
+from diffusers import AutoencoderKL, EulerDiscreteScheduler, EDMDPMSolverMultistepScheduler
+from transformers import (
+CLIPTextModel,
+CLIPTextModelWithProjection,
+CLIPTokenizer,
+)
+from scipy.spatial.distance import cdist
+import numpy as np
+import unet.pipeline_stable_diffusion_xl as pipeline_stable_diffusion_xl
+from torch.fft import fftn, fftshift, ifftn, ifftshift
+from typing import Optional, Tuple
+from unet.unet import UNet2DConditionModel
+from unet.unet_controller import UNetController
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+import os
+def ipca(q, k, v, scale, unet_controller: Optional[UNetController] = None):
+q_neg, q_pos = torch.split(q, q.size(0) // 2, dim=0)
+k_neg, k_pos = torch.split(k, k.size(0) // 2, dim=0)
+v_neg, v_pos = torch.split(v, v.size(0) // 2, dim=0)
+scores_neg = torch.matmul(q_neg, k_neg.transpose(-2, -1)) * scale
+attn_weights_neg = torch.softmax(scores_neg, dim=-1)
+attn_output_neg = torch.matmul(attn_weights_neg, v_neg)
+k_plus = torch.cat(tuple(k_pos.transpose(-2, -1)), dim=2).unsqueeze(0).repeat(k_pos.size(0),1,1,1)
+v_plus = torch.cat(tuple(v_pos), dim=1).unsqueeze(0).repeat(v_pos.size(0),1,1,1)
+if unet_controller is not None:
+scores_pos = torch.matmul(q_pos, k_plus) * scale
+dropout_mask = gen_dropout_mask(scores_pos.shape, unet_controller, unet_controller.Ipca_dropout)
+if unet_controller.Use_embeds_mask:
+apply_embeds_mask(unet_controller,dropout_mask, add_eot=False)
+mask = dropout_mask
+mask = mask.unsqueeze(1).repeat(1,scores_pos.size(1),1,1)
+attn_weights_pos = torch.softmax(scores_pos + torch.log(mask), dim=-1)
+else:
+scores_pos = torch.matmul(q_pos, k_plus) * scale
+attn_weights_pos = torch.softmax(scores_pos, dim=-1)
+attn_output_pos = torch.matmul(attn_weights_pos, v_plus)
+attn_output = torch.cat((attn_output_neg, attn_output_pos), dim=0)
+return attn_output
+def ipca2(q, k, v, scale, unet_controller: Optional[UNetController] = None):
+if unet_controller.ipca_time_step != unet_controller.current_time_step:
+unet_controller.ipca_time_step = unet_controller.current_time_step
+unet_controller.ipca2_index = 0
+else:
+unet_controller.ipca2_index += 1
+if unet_controller.Store_qkv is True:
+key = f"cross {unet_controller.current_time_step} {unet_controller.current_unet_position} {unet_controller.ipca2_index}"
+unet_controller.k_store[key] = k
+unet_controller.v_store[key] = v
+scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+attn_weights = torch.softmax(scores, dim=-1)
+attn_output = torch.matmul(attn_weights, v)
+else:
+if unet_controller.frame_prompt_express_list is not None:
+batch_size = q.size(0) // 2
+attn_output_list = []
+for i in range(batch_size):
+q_i = q[[i, i + batch_size], :, :, :]
+k_i = k[[i, i + batch_size], :, :, :]
+v_i = v[[i, i + batch_size], :, :, :]
+q_neg_i, q_pos_i = torch.split(q_i, q_i.size(0) // 2, dim=0)
+k_neg_i, k_pos_i = torch.split(k_i, k_i.size(0) // 2, dim=0)
+v_neg_i, v_pos_i = torch.split(v_i, v_i.size(0) // 2, dim=0)
+key = f"cross {unet_controller.current_time_step} {unet_controller.current_unet_position} {unet_controller.ipca2_index}"
+q_store = q_i
+k_store = unet_controller.k_store[key]
+v_store = unet_controller.v_store[key]
+q_store_neg, q_store_pos = torch.split(q_store, q_store.size(0) // 2, dim=0)
+k_store_neg, k_store_pos = torch.split(k_store, k_store.size(0) // 2, dim=0)
+v_store_neg, v_store_pos = torch.split(v_store, v_store.size(0) // 2, dim=0)
+q_neg = torch.cat((q_neg_i, q_store_neg), dim=0)
+q_pos = torch.cat((q_pos_i, q_store_pos), dim=0)
+k_neg = torch.cat((k_neg_i, k_store_neg), dim=0)
+k_pos = torch.cat((k_pos_i, k_store_pos), dim=0)
+v_neg = torch.cat((v_neg_i, v_store_neg), dim=0)
+v_pos = torch.cat((v_pos_i, v_store_pos), dim=0)
+q_i = torch.cat((q_neg, q_pos), dim=0)
+k_i = torch.cat((k_neg, k_pos), dim=0)
+v_i = torch.cat((v_neg, v_pos), dim=0)
+attn_output_i = ipca(q_i, k_i, v_i, scale, unet_controller)
+attn_output_i = attn_output_i[[0, 2], :, :, :]
+attn_output_list.append(attn_output_i)
+attn_output_ = torch.cat(attn_output_list, dim=0)
+attn_output = torch.zeros(size=(q.size(0), attn_output_i.size(1), attn_output_i.size(2), attn_output_i.size(3)), device=q.device, dtype=q.dtype)
+for i in range(batch_size):
+attn_output[i] = attn_output_[i*2]
+for i in range(batch_size):
+attn_output[i + batch_size] = attn_output_[i*2 + 1]
+else:
+q_neg, q_pos = torch.split(q, q.size(0) // 2, dim=0)
+k_neg, k_pos = torch.split(k, k.size(0) // 2, dim=0)
+v_neg, v_pos = torch.split(v, v.size(0) // 2, dim=0)
+key = f"cross {unet_controller.current_time_step} {unet_controller.current_unet_position} {unet_controller.ipca2_index}"
+q_store = q
+k_store = unet_controller.k_store[key]
+v_store = unet_controller.v_store[key]
+q_store_neg, q_store_pos = torch.split(q_store, q_store.size(0) // 2, dim=0)
+k_store_neg, k_store_pos = torch.split(k_store, k_store.size(0) // 2, dim=0)
+v_store_neg, v_store_pos = torch.split(v_store, v_store.size(0) // 2, dim=0)
+q_neg = torch.cat((q_neg, q_store_neg), dim=0)
+q_pos = torch.cat((q_pos, q_store_pos), dim=0)
+k_neg = torch.cat((k_neg, k_store_neg), dim=0)
+k_pos = torch.cat((k_pos, k_store_pos), dim=0)
+v_neg = torch.cat((v_neg, v_store_neg), dim=0)
+v_pos = torch.cat((v_pos, v_store_pos), dim=0)
+q = torch.cat((q_neg, q_pos), dim=0)
+k = torch.cat((k_neg, k_pos), dim=0)
+v = torch.cat((v_neg, v_pos), dim=0)
+attn_output = ipca(q, k, v, scale, unet_controller)
+attn_output = attn_output[[0, 2], :, :, :]
+return attn_output
+def apply_embeds_mask(unet_controller: Optional[UNetController],dropout_mask, add_eot=False):
+id_prompt = unet_controller.id_prompt
+prompt_tokens = prompt2tokens(unet_controller.tokenizer,unet_controller.prompts[0])
+words_tokens = prompt2tokens(unet_controller.tokenizer,id_prompt)
+words_tokens = [word for word in words_tokens if word != '<|endoftext|>' and word != '<|startoftext|>']
+index_of_words = find_sublist_index(prompt_tokens,words_tokens)
+index_list = [index+77 for index in range(index_of_words, index_of_words+len(words_tokens))]
+if add_eot:
+index_list.extend([index+77 for index, word in enumerate(prompt_tokens) if word == '<|endoftext|>'])
+mask_indices = torch.arange(dropout_mask.size(-1), device=dropout_mask.device)
+mask = (mask_indices >= 78) & (~torch.isin(mask_indices, torch.tensor(index_list, device=dropout_mask.device)))
+dropout_mask[0, :, mask] = 0
+def gen_dropout_mask(out_shape, unet_controller: Optional[UNetController], drop_out):
+gen_length = out_shape[3]
+attn_map_side_length = out_shape[2]
+batch_num = out_shape[0]
+mask_list = []
+for prompt_index in range(batch_num):
+start = prompt_index * int(gen_length / batch_num)
+end = (prompt_index + 1) * int(gen_length / batch_num)
+mask = torch.bernoulli(torch.full((attn_map_side_length,gen_length), 1 - drop_out, dtype=unet_controller.torch_dtype, device=unet_controller.device))
+mask[:, start:end] = 1
+mask_list.append(mask)
+concatenated_mask = torch.stack(mask_list, dim=0)
+return concatenated_mask
+def load_pipe_from_path(model_path, device, torch_dtype, variant):
+if device.startswith('cuda'):
+if not torch.cuda.is_available():
+raise RuntimeError(f"CUDA不可用，但尝试使用设备: {device}")
+if ':' in device:
+device_idx = int(device.split(':')[1])
+if device_idx >= torch.cuda.device_count():
+raise RuntimeError(f"设备 {device} 不存在。系统只有 {torch.cuda.device_count()} 个GPU (0-{torch.cuda.device_count()-1})")
+model_name = model_path.split('/')[-1]
+if model_path.split('/')[-1] == 'playground-v2.5-1024px-aesthetic':
+scheduler = EDMDPMSolverMultistepScheduler.from_pretrained(model_path, subfolder="scheduler", torch_dtype=torch_dtype, variant=variant,)
+else:
+scheduler = EulerDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler", torch_dtype=torch_dtype, variant=variant,)
+if model_path.split('/')[-1] == 'Juggernaut-X-v10' or model_path.split('/')[-1] == 'Juggernaut-XI-v11':
+variant = None
+vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=torch_dtype, variant=variant,)
+tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", torch_dtype=torch_dtype, variant=variant,)
+tokenizer_2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", torch_dtype=torch_dtype, variant=variant,)
+text_encoder = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=torch_dtype, variant=variant,)
+text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=torch_dtype, variant=variant,)
+unet_new = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=torch_dtype, variant=variant,)
+pipe = pipeline_stable_diffusion_xl.StableDiffusionXLPipeline(
+vae=vae,
+text_encoder=text_encoder,
+text_encoder_2=text_encoder_2,
+tokenizer=tokenizer,
+tokenizer_2=tokenizer_2,
+unet=unet_new,
+scheduler=scheduler,
+)
+try:
+pipe.to(device)
+except RuntimeError as e:
+if "invalid device ordinal" in str(e) or "CUDA error" in str(e):
+raise RuntimeError(f"无法将模型移动到设备 {device}。请检查设备是否可用。系统有 {torch.cuda.device_count()} 个GPU。") from e
+raise
+return pipe, model_name, tokenizer
+def get_max_window_length(unet_controller: Optional[UNetController],id_prompt, frame_prompt_list):
+single_long_prompt = id_prompt
+max_window_length = 0
+for index, movement in enumerate(frame_prompt_list):
+single_long_prompt += ' ' + movement
+token_length = len(single_long_prompt.split())
+if token_length >= 77:
+break
+max_window_length += 1
+return max_window_length
+def movement_gen_story_slide_windows(id_prompt, frame_prompt_list, pipe, window_length, seed, unet_controller: Optional[UNetController], save_dir, verbose=True):
+import os
+if unet_controller is not None:
+unet_controller.result_save_dir = save_dir
+max_window_length = get_max_window_length(unet_controller,id_prompt,frame_prompt_list)
+window_length = min(window_length,max_window_length)
+if window_length < len(frame_prompt_list):
+movement_lists = circular_sliding_windows(frame_prompt_list, window_length)
+else:
+movement_lists = [movement for movement in frame_prompt_list]
+story_images = []
+if verbose:
+print("seed:", seed)
+generate = torch.Generator().manual_seed(seed)
+unet_controller.id_prompt = id_prompt
+for index, movement in enumerate(frame_prompt_list):
+if unet_controller is not None:
+clear_modulation = not (unet_controller.Visualize_modulation_scores if hasattr(unet_controller, 'Visualize_modulation_scores') else False)
+unet_controller.reset_attn_store(clear_modulation_scores=clear_modulation)
+unet_controller.current_frame_index = index
+if index == 0:
+unet_controller.reset_first_frame_kv()
+if unet_controller is not None:
+if window_length < len(frame_prompt_list):
+unet_controller.frame_prompt_suppress = movement_lists[index][1:]
+unet_controller.frame_prompt_express = movement_lists[index][0]
+if unet_controller.Prompt_embeds_mode in ['svr-single', 'single']:
+gen_propmts = [f'{id_prompt} {movement_lists[index][0]}']
+else:
+gen_propmts = [f'{id_prompt} {" ".join(movement_lists[index])}']
+else:
+unet_controller.frame_prompt_suppress = movement_lists[:index] + movement_lists[index+1:]
+unet_controller.frame_prompt_express = movement_lists[index]
+if unet_controller.Prompt_embeds_mode in ['svr-single', 'single']:
+gen_propmts = [f'{id_prompt} {movement_lists[index]}']
+else:
+gen_propmts = [f'{id_prompt} {" ".join(movement_lists)}']
+if verbose:
+print(f"suppress: {unet_controller.frame_prompt_suppress}")
+print(f"express: {unet_controller.frame_prompt_express}")
+print(f'id_prompt: {id_prompt}')
+print(f"gen_propmts: {gen_propmts}")
+else:
+gen_propmts = f'{id_prompt} {movement}'
+if unet_controller is not None and unet_controller.Use_same_init_noise is True:
+generate = torch.Generator().manual_seed(seed)
+images = pipe(gen_propmts, generator=generate, unet_controller=unet_controller).images
+story_images.append(images[0])
+images[0].save(os.path.join(save_dir, f'{id_prompt} {unet_controller.frame_prompt_express}.jpg'))
+if (unet_controller is not None and
+unet_controller.tokenizer is not None and
+unet_controller.Visualize_attn_map):
+try:
+from unet.atten_store import visualize_cross_attn_from_controller
+cross_attn_save_dir = os.path.join(save_dir, "cross_attn_vis", f"frame_{index:03d}")
+os.makedirs(cross_attn_save_dir, exist_ok=True)
+current_prompt = gen_propmts[0] if isinstance(gen_propmts, list) else gen_propmts
+layer_groups = {
+"down": ["down0", "down1", "down2"],
+"mid": ["mid"],
+"up": ["up0", "up1", "up2"]
+}
+for layer_name, layer_list in layer_groups.items():
+cross_attn_vis = visualize_cross_attn_from_controller(
+tokenizer=unet_controller.tokenizer,
+prompt=current_prompt,
+unet_controller=unet_controller,
+res=32,
+from_where=layer_list,
+save_dir=cross_attn_save_dir,
+save_filename=f"cross_attn_{layer_name}.png",
+colormap="white",
+show_fig=False
+)
+if verbose:
+print(f"交叉注意力可视化完成 ({layer_name})，保存至：{cross_attn_save_dir}")
+except Exception as e:
+if verbose:
+print(f"交叉注意力可视化失败：{e}")
+import traceback
+traceback.print_exc()
+image_array_list = [np.array(pil_img) for pil_img in story_images]
+story_image = np.concatenate(image_array_list, axis=1)
+story_image = Image.fromarray(story_image.astype(np.uint8))
+if unet_controller.Save_story_image:
+story_image.save(os.path.join(save_dir, f'story_image_{id_prompt}.jpg'))
+return story_images, story_image
+def movement_gen_story_slide_windows_batch(id_prompt, frame_prompt_list, pipe, window_length, seed, unet_controller: Optional[UNetController], save_dir, batch_size=3):
+import os
+max_window_length = get_max_window_length(unet_controller,id_prompt,frame_prompt_list)
+window_length = min(window_length,max_window_length)
+if window_length < len(frame_prompt_list):
+movement_lists = circular_sliding_windows(frame_prompt_list, window_length)
+else:
+movement_lists = [movement for movement in frame_prompt_list]
+story_images = []
+print("seed:", seed)
+generate = torch.Generator().manual_seed(seed)
+unet_controller.id_prompt = id_prompt
+gen_prompt_info_list = []
+gen_prompt = None
+for index, _ in enumerate(frame_prompt_list):
+if window_length < len(frame_prompt_list):
+frame_prompt_suppress = movement_lists[index][1:]
+frame_prompt_express = movement_lists[index][0]
+if unet_controller.Prompt_embeds_mode in ['svr-single', 'single']:
+gen_prompt = f'{id_prompt} {movement_lists[index][0]}'
+else:
+gen_prompt = f'{id_prompt} {" ".join(movement_lists[index])}'
+else:
+frame_prompt_suppress = movement_lists[:index] + movement_lists[index+1:]
+frame_prompt_express = movement_lists[index]
+if unet_controller.Prompt_embeds_mode in ['svr-single', 'single']:
+gen_prompt = f'{id_prompt} {movement_lists[index]}'
+else:
+gen_prompt = f'{id_prompt} {" ".join(movement_lists)}'
+gen_prompt_info_list.append({'frame_prompt_suppress': frame_prompt_suppress, 'frame_prompt_express': frame_prompt_express, 'gen_prompt': gen_prompt})
+story_images = []
+for i in range(0, len(gen_prompt_info_list), batch_size):
+batch = gen_prompt_info_list[i:i + batch_size]
+gen_prompts = [gen_prompt_info['gen_prompt'] for gen_prompt_info in batch]
+unet_controller.frame_prompt_express_list = [gen_prompt_info['frame_prompt_express'] for gen_prompt_info in batch]
+unet_controller.frame_prompt_suppress_list = [gen_prompt_info['frame_prompt_suppress'] for gen_prompt_info in batch]
+if unet_controller is not None and unet_controller.Use_same_init_noise is True:
+generate = torch.Generator().manual_seed(seed)
+images = pipe(gen_prompts, generator=generate, unet_controller=unet_controller).images
+for index,image in enumerate(images):
+story_images.append(image)
+image.save(os.path.join(save_dir, f'{id_prompt} {unet_controller.frame_prompt_express_list[index]}.jpg'))
+image_array_list = [np.array(pil_img) for pil_img in story_images]
+story_image = np.concatenate(image_array_list, axis=1)
+story_image = Image.fromarray(story_image.astype(np.uint8))
+if unet_controller.Save_story_image:
+story_image.save(os.path.join(save_dir, 'story_image.jpg'))
+return story_images, story_image
+def prompt2tokens(tokenizer, prompt):
+text_inputs = tokenizer(
+prompt,
+padding="max_length",
+max_length=tokenizer.model_max_length,
+truncation=True,
+return_tensors="pt",
+)
+text_input_ids = text_inputs.input_ids
+tokens = []
+for text_input_id in text_input_ids[0]:
+token = tokenizer.decoder[text_input_id.item()]
+tokens.append(token)
+return tokens
+def punish_wight(tensor, latent_size, alpha=1.0, beta=1.2, calc_similarity=False):
+u, s, vh = torch.linalg.svd(tensor)
+u = u[:,:latent_size]
+zero_idx = int(latent_size * alpha)
+if calc_similarity:
+_s = s.clone()
+_s *= torch.exp(-alpha*_s) * beta
+_s[zero_idx:] = 0
+_tensor = u @ torch.diag(_s) @ vh
+dist = cdist(tensor[:,0].unsqueeze(0).cpu(), _tensor[:,0].unsqueeze(0).cpu(), metric='cosine')
+print(f'The distance between the word embedding before and after the punishment: {dist}')
+s *= torch.exp(-alpha*s) * beta
+tensor = u @ torch.diag(s) @ vh
+return tensor
+def swr_single_prompt_embeds(swr_words,prompt_embeds,prompt,tokenizer,alpha=1.0, beta=1.2, zero_eot=False):
+punish_indices = []
+prompt_tokens = prompt2tokens(tokenizer,prompt)
+words_tokens = prompt2tokens(tokenizer,swr_words)
+words_tokens = [word for word in words_tokens if word != '<|endoftext|>' and word != '<|startoftext|>']
+index_of_words = find_sublist_index(prompt_tokens,words_tokens)
+if index_of_words != -1:
+punish_indices.extend([num for num in range(index_of_words, index_of_words+len(words_tokens))])
+if zero_eot:
+eot_indices = [index for index, word in enumerate(prompt_tokens) if word == '<|endoftext|>']
+prompt_embeds[eot_indices] *= 9e-1
+pass
+else:
+punish_indices.extend([index for index, word in enumerate(prompt_tokens) if word == '<|endoftext|>'])
+punish_indices = list(set(punish_indices))
+wo_batch = prompt_embeds[punish_indices]
+wo_batch = punish_wight(wo_batch.T.to(float), wo_batch.size(0), alpha=alpha, beta=beta, calc_similarity=False).T.to(prompt_embeds.dtype)
+prompt_embeds[punish_indices] = wo_batch
+def find_sublist_index(list1, list2):
+for i in range(len(list1) - len(list2) + 1):
+if list1[i:i + len(list2)] == list2:
+return i
+return -1
+def fourier_filter(x_in: "torch.Tensor", threshold: int, scale: int) -> "torch.Tensor":
+x = x_in
+B, C, H, W = x.shape
+x = x.to(dtype=torch.float32)
+x_freq = fftn(x, dim=(-2, -1))
+x_freq = fftshift(x_freq, dim=(-2, -1))
+B, C, H, W = x_freq.shape
+mask = torch.ones((B, C, H, W), device=x.device)
+crow, ccol = H // 2, W // 2
+mask[..., crow - threshold : crow + threshold, ccol - threshold : ccol + threshold] = scale
+x_freq = x_freq * mask
+x_freq = ifftshift(x_freq, dim=(-2, -1))
+x_filtered = ifftn(x_freq, dim=(-2, -1)).real
+return x_filtered.to(dtype=x_in.dtype)
+def apply_freeu(
+resolution_idx: int, hidden_states: "torch.Tensor", res_hidden_states: "torch.Tensor", **freeu_kwargs
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+if resolution_idx == 0:
+num_half_channels = hidden_states.shape[1] // 2
+hidden_states[:, :num_half_channels] = hidden_states[:, :num_half_channels] * freeu_kwargs["b1"]
+res_hidden_states = fourier_filter(res_hidden_states, threshold=1, scale=freeu_kwargs["s1"])
+if resolution_idx == 1:
+num_half_channels = hidden_states.shape[1] // 2
+hidden_states[:, :num_half_channels] = hidden_states[:, :num_half_channels] * freeu_kwargs["b2"]
+res_hidden_states = fourier_filter(res_hidden_states, threshold=1, scale=freeu_kwargs["s2"])
+return hidden_states, res_hidden_states
+def circular_sliding_windows(lst, w):
+n = len(lst)
+windows = []
+for i in range(n):
+window = [lst[(i + j) % n] for j in range(w)]
+windows.append(window)
+return
+def visualize_image_text_cross_attn(
+attn_weights,
+text_tokens,
+target_token,
+image_size=(512, 512),
+patch_size=(32, 32),
+save_path="./image_text_attn.png",
+dpi=200
+):
+if hasattr(attn_weights, 'detach'):
+attn_weights = attn_weights.detach().cpu().numpy()
+if len(attn_weights.shape) == 3:
+attn_weights = np.mean(attn_weights, axis=0)
+if target_token not in text_tokens:
+raise ValueError(f"目标Token {target_token} 不在文本Token列表中")
+token_idx = text_tokens.index(target_token)
+token_attn = attn_weights[:, token_idx]
+patch_num_h = image_size[0] // patch_size[0]
+patch_num_w = image_size[1] // patch_size[1]
+t_q = patch_num_h * patch_num_w
+assert t_q == attn_weights.shape[0], f"图像分块数 {t_q} 与Query序列长度 {attn_weights.shape[0]} 不匹配"
+attn_map = token_attn.reshape(patch_num_h, patch_num_w)
+attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
+fig, (ax_img, ax_text) = plt.subplots(1, 2, figsize=(8, 4), gridspec_kw={'width_ratios': [1, 1]})
+fig.subplots_adjust(wspace=0.1)
+im = ax_img.imshow(attn_map, cmap='viridis', aspect='equal', interpolation='bilinear')
+for spine in ax_img.spines.values():
+spine.set_color('blue')
+spine.set_linestyle('--')
+spine.set_linewidth(2)
+ax_img.set_xticks([])
+ax_img.set_yticks([])
+ax_img.text(0.5, -0.1, target_token, ha='center', va='top', transform=ax_img.transAxes, fontsize=14,
+fontweight='bold')
+ax_text.imshow(np.random.rand(patch_num_h, patch_num_w) * 0.2, cmap='gray', aspect='equal',
+interpolation='bilinear')
+ax_text.text(0.5, 0.5, text_tokens[1] if len(text_tokens) >= 2 else "text", ha='center', va='center',
+fontsize=14, fontweight='bold', color='black', transform=ax_text.transAxes)
+ax_text.set_xticks([])
+ax_text.set_yticks([])
+for spine in ax_text.spines.values():
+spine.set_color('blue')
+spine.set_linestyle('--')
+spine.set_linewidth(2)
+fig.text(0.5, 0.5, '...', ha='center', va='center', fontsize=20, color='black')
+plt.savefig(save_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
+plt.close(fig)
+print(f"图像-文本交叉注意力图已保存至：{save_path}")
+def save_single_modulation_score(
+before_scores: torch.Tensor,
+after_scores: torch.Tensor,
+timestep: int,
+block_position: str,
+save_dir: str,
+frame_index: int = None,
+is_cross_attention: bool = False,
+tokenizer=None,
+prompt: str = None
+):
+import os
+import math
+import torch.nn.functional as F
+if frame_index is not None:
+frame_dir = os.path.join(save_dir, f"frame_{frame_index:03d}")
+else:
+frame_dir = save_dir
+os.makedirs(frame_dir, exist_ok=True)
+seq_len_q = before_scores.shape[0]
+original_size = int(math.sqrt(seq_len_q))
+if original_size * original_size != seq_len_q:
+return
+if is_cross_attention and tokenizer is not None and prompt is not None:
+seq_len_k = before_scores.shape[1]
+try:
+prompt_tokens = prompt2tokens(tokenizer, prompt)
+prompt_tokens = [tok for tok in prompt_tokens if tok not in ['<|endoftext|>', '<|startoftext|>']]
+except:
+prompt_tokens = None
+token_images_before = []
+token_images_after = []
+token_texts = []
+for token_idx in range(min(seq_len_k, len(prompt_tokens) if prompt_tokens else seq_len_k)):
+before_token_scores = before_scores[:, token_idx]
+after_token_scores = after_scores[:, token_idx]
+before_sum = before_token_scores.sum()
+after_sum = after_token_scores.sum()
+if before_sum > 0:
+before_token_scores = before_token_scores / before_sum
+if after_sum > 0:
+after_token_scores = after_token_scores / after_sum
+before_vis_2d = before_token_scores.view(1, 1, original_size, original_size)
+after_vis_2d = after_token_scores.view(1, 1, original_size, original_size)
+target_size = min(256, original_size) if original_size < 256 else 256
+before_vis_2d_resized = F.interpolate(
+before_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+after_vis_2d_resized = F.interpolate(
+after_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+before_min = before_vis_2d_resized.min()
+before_max = before_vis_2d_resized.max()
+if before_max > before_min:
+before_vis_2d_resized = (before_vis_2d_resized - before_min) / (before_max - before_min)
+else:
+before_vis_2d_resized = torch.zeros_like(before_vis_2d_resized)
+after_min = after_vis_2d_resized.min()
+after_max = after_vis_2d_resized.max()
+if after_max > after_min:
+after_vis_2d_resized = (after_vis_2d_resized - after_min) / (after_max - after_min)
+else:
+after_vis_2d_resized = torch.zeros_like(after_vis_2d_resized)
+before_np = (before_vis_2d_resized.numpy() * 255).astype(np.uint8)
+after_np = (after_vis_2d_resized.numpy() * 255).astype(np.uint8)
+token_images_before.append(before_np)
+token_images_after.append(after_np)
+if prompt_tokens and token_idx < len(prompt_tokens):
+token_text = prompt_tokens[token_idx]
+token_text = token_text.replace('</w>', '').replace('<|endoftext|>', '').replace('<|startoftext|>', '')
+token_texts.append(token_text)
+else:
+token_texts.append(f"token_{token_idx}")
+if token_images_before:
+text_height = 40
+img_height, img_width = token_images_before[0].shape
+total_width = img_width * len(token_images_before)
+total_height = img_height + text_height
+before_concatenated = np.ones((total_height, total_width), dtype=np.uint8) * 255
+after_concatenated = np.ones((total_height, total_width), dtype=np.uint8) * 255
+for idx, (before_img, after_img) in enumerate(zip(token_images_before, token_images_after)):
+x_start = idx * img_width
+x_end = x_start + img_width
+before_concatenated[:img_height, x_start:x_end] = before_img
+after_concatenated[:img_height, x_start:x_end] = after_img
+before_pil = Image.fromarray(before_concatenated, mode='L').convert('RGB')
+after_pil = Image.fromarray(after_concatenated, mode='L').convert('RGB')
+from PIL import ImageDraw, ImageFont
+draw_before = ImageDraw.Draw(before_pil)
+draw_after = ImageDraw.Draw(after_pil)
+try:
+font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+except:
+font = ImageFont.load_default()
+for idx, token_text in enumerate(token_texts):
+x_start = idx * img_width
+x_center = x_start + img_width // 2
+y_text = img_height + 10
+text_bbox = draw_before.textbbox((0, 0), token_text, font=font)
+text_width = text_bbox[2] - text_bbox[0]
+draw_before.text((x_center - text_width // 2, y_text), token_text, fill='black', font=font)
+draw_after.text((x_center - text_width // 2, y_text), token_text, fill='black', font=font)
+before_path = os.path.join(frame_dir, f"t{timestep:03d}_{block_position}_before.png")
+after_path = os.path.join(frame_dir, f"t{timestep:03d}_{block_position}_after.png")
+before_pil.save(before_path)
+after_pil.save(after_path)
+else:
+before_vis = before_scores.sum(dim=-1)
+after_vis = after_scores.sum(dim=-1)
+before_sum = before_vis.sum()
+after_sum = after_vis.sum()
+if before_sum > 0:
+before_vis = before_vis / before_sum
+if after_sum > 0:
+after_vis = after_vis / after_sum
+before_vis_2d = before_vis.view(1, 1, original_size, original_size)
+after_vis_2d = after_vis.view(1, 1, original_size, original_size)
+target_size = min(256, original_size) if original_size < 256 else 256
+before_vis_2d_resized = F.interpolate(
+before_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+after_vis_2d_resized = F.interpolate(
+after_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+before_min = before_vis_2d_resized.min()
+before_max = before_vis_2d_resized.max()
+if before_max > before_min:
+before_vis_2d_resized = (before_vis_2d_resized - before_min) / (before_max - before_min)
+else:
+before_vis_2d_resized = torch.zeros_like(before_vis_2d_resized)
+after_min = after_vis_2d_resized.min()
+after_max = after_vis_2d_resized.max()
+if after_max > after_min:
+after_vis_2d_resized = (after_vis_2d_resized - after_min) / (after_max - after_min)
+else:
+after_vis_2d_resized = torch.zeros_like(after_vis_2d_resized)
+before_np = (before_vis_2d_resized.numpy() * 255).astype(np.uint8)
+after_np = (after_vis_2d_resized.numpy() * 255).astype(np.uint8)
+before_img = Image.fromarray(before_np, mode='L')
+after_img = Image.fromarray(after_np, mode='L')
+before_bitmap_path = os.path.join(frame_dir, f"t{timestep:03d}_{block_position}_before.png")
+after_bitmap_path = os.path.join(frame_dir, f"t{timestep:03d}_{block_position}_after.png")
+before_img.save(before_bitmap_path)
+after_img.save(after_bitmap_path)
+def visualize_modulation_scores(
+unet_controller: UNetController,
+save_dir: str = "result/Attention-modulation-visualization",
+save_filename: str = "modulation_scores.png"
+):
+import os
+import math
+import torch.nn.functional as F
+if not unet_controller.modulation_scores_store:
+print("警告：没有找到modulation scores数据，跳过可视化")
+return
+os.makedirs(save_dir, exist_ok=True)
+block_scores = {}
+for block_key, scores_dict in unet_controller.modulation_scores_store.items():
+parts = block_key.split('_')
+if len(parts) < 4 or not parts[-1].startswith('t'):
+continue
+timestep_str = parts[-1][1:]
+try:
+timestep = int(timestep_str)
+except ValueError:
+continue
+block_position = '_'.join(parts[:-1])
+before_scores = scores_dict.get('before')
+after_scores = scores_dict.get('after')
+if before_scores is None or after_scores is None:
+continue
+block_scores[(timestep, block_position)] = {
+'before': before_scores,
+'after': after_scores
+}
+if not block_scores:
+print("警告：没有找到modulation scores数据，跳过可视化")
+return
+for (timestep, block_position) in sorted(block_scores.keys()):
+scores_dict = block_scores[(timestep, block_position)]
+before_scores = scores_dict['before']
+after_scores = scores_dict['after']
+before_vis = before_scores.sum(dim=-1)
+after_vis = after_scores.sum(dim=-1)
+before_sum = before_vis.sum()
+after_sum = after_vis.sum()
+if before_sum > 0:
+before_vis = before_vis / before_sum
+if after_sum > 0:
+after_vis = after_vis / after_sum
+seq_len_q = before_vis.shape[0]
+original_size = int(math.sqrt(seq_len_q))
+if original_size * original_size != seq_len_q:
+print(f"警告：timestep {timestep} 的seq_len_q={seq_len_q}不是完全平方数，跳过可视化")
+continue
+before_vis_2d = before_vis.view(1, 1, original_size, original_size)
+after_vis_2d = after_vis.view(1, 1, original_size, original_size)
+target_size = min(128, original_size) if original_size < 128 else 128
+before_vis_2d_resized = F.interpolate(
+before_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+after_vis_2d_resized = F.interpolate(
+after_vis_2d,
+size=(target_size, target_size),
+mode='bilinear',
+align_corners=False
+).squeeze(0).squeeze(0)
+before_min = before_vis_2d_resized.min()
+before_max = before_vis_2d_resized.max()
+if before_max > before_min:
+before_vis_2d_resized = (before_vis_2d_resized - before_min) / (before_max - before_min)
+else:
+before_vis_2d_resized = torch.zeros_like(before_vis_2d_resized)
+after_min = after_vis_2d_resized.min()
+after_max = after_vis_2d_resized.max()
+if after_max > after_min:
+after_vis_2d_resized = (after_vis_2d_resized - after_min) / (after_max - after_min)
+else:
+after_vis_2d_resized = torch.zeros_like(after_vis_2d_resized)
+before_np = (before_vis_2d_resized.numpy() * 255).astype(np.uint8)
+after_np = (after_vis_2d_resized.numpy() * 255).astype(np.uint8)
+before_img = Image.fromarray(before_np, mode='L')
+after_img = Image.fromarray(after_np, mode='L')
+before_bitmap_path = os.path.join(save_dir, f"{timestep}_{block_position}_before.png")
+after_bitmap_path = os.path.join(save_dir, f"{timestep}_{block_position}_after.png")
+before_img.save(before_bitmap_path)
+after_img.save(after_bitmap_path)
+abs_save_dir = os.path.abspath(save_dir)
+print(f"Modulation scores可视化已保存至：{abs_save_dir}，共{len(block_scores)}个block")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin
+from typing import Optional
+from unet.unet_controller import UNetController
+import unet.utils as utils
+def create_rectangular_mask(seq_len_q, coords, device, dtype):
+left, right, top, bottom = coords
+spatial_size = int(math.sqrt(seq_len_q))
+if spatial_size * spatial_size != seq_len_q:
+return torch.ones(seq_len_q, device=device, dtype=dtype)
+y_coords, x_coords = torch.meshgrid(
+torch.arange(spatial_size, device=device, dtype=dtype),
+torch.arange(spatial_size, device=device, dtype=dtype),
+indexing='ij'
+)
+x_norm = x_coords.float() / spatial_size
+y_norm = y_coords.float() / spatial_size
+mask = ((x_norm >= left) & (x_norm <= right) &
+(y_norm >= bottom) & (y_norm <= top)).float()
+count = torch.sum(mask).item()
+mask = mask.reshape(-1)
+return mask
+class Timesteps(nn.Module):
+def __init__(self, num_channels: int = 320):
+super().__init__()
+self.num_channels = num_channels
+def forward(self, timesteps):
+half_dim = self.num_channels // 2
+exponent = -math.log(10000) * torch.arange(
+half_dim, dtype=torch.float32, device=timesteps.device
+)
+exponent = exponent / (half_dim - 0.0)
+emb = torch.exp(exponent)
+emb = timesteps[:, None].float() * emb[None, :]
+sin_emb = torch.sin(emb)
+cos_emb = torch.cos(emb)
+emb = torch.cat([cos_emb, sin_emb], dim=-1)
+return emb
+class TimestepEmbedding(nn.Module):
+def __init__(self, in_features, out_features):
+super(TimestepEmbedding, self).__init__()
+self.linear_1 = nn.Linear(in_features, out_features, bias=True)
+self.act = nn.SiLU()
+self.linear_2 = nn.Linear(out_features, out_features, bias=True)
+def forward(self, sample):
+sample = self.linear_1(sample)
+sample = self.act(sample)
+sample = self.linear_2(sample)
+return sample
+class ResnetBlock2D(nn.Module):
+def __init__(self, in_channels, out_channels, conv_shortcut=True):
+super(ResnetBlock2D, self).__init__()
+self.norm1 = nn.GroupNorm(32, in_channels, eps=1e-05, affine=True)
+self.conv1 = nn.Conv2d(
+in_channels, out_channels, kernel_size=3, stride=1, padding=1
+)
+self.time_emb_proj = nn.Linear(1280, out_channels, bias=True)
+self.norm2 = nn.GroupNorm(32, out_channels, eps=1e-05, affine=True)
+self.dropout = nn.Dropout(p=0.0, inplace=False)
+self.conv2 = nn.Conv2d(
+out_channels, out_channels, kernel_size=3, stride=1, padding=1
+)
+self.nonlinearity = nn.SiLU()
+self.conv_shortcut = None
+if conv_shortcut:
+self.conv_shortcut = nn.Conv2d(
+in_channels, out_channels, kernel_size=1, stride=1
+)
+def forward(self, input_tensor, temb):
+hidden_states = input_tensor
+hidden_states = self.norm1(hidden_states)
+hidden_states = self.nonlinearity(hidden_states)
+hidden_states = self.conv1(hidden_states)
+temb = self.nonlinearity(temb)
+temb = self.time_emb_proj(temb)[:, :, None, None]
+hidden_states = hidden_states + temb
+hidden_states = self.norm2(hidden_states)
+hidden_states = self.nonlinearity(hidden_states)
+hidden_states = self.dropout(hidden_states)
+hidden_states = self.conv2(hidden_states)
+if self.conv_shortcut is not None:
+input_tensor = self.conv_shortcut(input_tensor)
+output_tensor = input_tensor + hidden_states
+return output_tensor
+class Attention(nn.Module):
+def __init__(
+self, inner_dim, cross_attention_dim=None, num_heads=None, dropout=0.0
+):
+super(Attention, self).__init__()
+if num_heads is None:
+self.head_dim = 64
+self.num_heads = inner_dim // self.head_dim
+else:
+self.num_heads = num_heads
+self.head_dim = inner_dim // num_heads
+self.scale = self.head_dim**-0.5
+if cross_attention_dim is None:
+cross_attention_dim = inner_dim
+self.to_q = nn.Linear(inner_dim, inner_dim, bias=False)
+self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+self.to_out = nn.ModuleList(
+[nn.Linear(inner_dim, inner_dim), nn.Dropout(dropout, inplace=False)]
+)
+def forward(self, hidden_states, encoder_hidden_states=None, unet_controller: Optional[UNetController] = None, layer_idx: int = 0):
+is_cross_attention = (encoder_hidden_states is not None)
+if (unet_controller is not None and
+unet_controller.Use_id_replacement and
+is_cross_attention and
+encoder_hidden_states is not None and
+unet_controller.current_time_step is not None):
+unet_position = unet_controller.current_unet_position
+position_prefix = None
+if unet_position:
+if unet_position.startswith('down'):
+position_prefix = 'down'
+elif unet_position.startswith('up'):
+position_prefix = 'up'
+elif unet_position.startswith('mid'):
+position_prefix = 'mid'
+timestep = unet_controller.current_time_step
+if isinstance(timestep, torch.Tensor):
+timestep_value = timestep.item() if timestep.numel() == 1 else int(timestep[0].item())
+else:
+timestep_value = int(timestep)
+in_timestep_range = (
+timestep_value >= unet_controller.Id_replacement_start_step and
+timestep_value <= unet_controller.Id_replacement_end_step
+)
+position_allowed = (
+position_prefix is not None and
+position_prefix in unet_controller.Id_replacement_position
+)
+if position_allowed and in_timestep_range:
+if unet_controller.current_frame_index == 0:
+unet_controller.save_first_frame_id_embeds(encoder_hidden_states)
+else:
+first_id_embeds = unet_controller.get_first_frame_id_embeds()
+first_id_norm = unet_controller.get_first_frame_id_norm()
+if (first_id_embeds is not None and
+first_id_norm is not None and
+first_id_norm > 0 and
+unet_controller.id_prompt_token_indices is not None):
+start_idx, end_idx = unet_controller.id_prompt_token_indices
+if (start_idx >= 0 and end_idx <= encoder_hidden_states.shape[1] and
+end_idx - start_idx == first_id_embeds.shape[1]):
+encoder_hidden_states = encoder_hidden_states.clone()
+if (unet_controller.do_classifier_free_guidance and
+encoder_hidden_states.shape[0] >= 2):
+half_batch = encoder_hidden_states.shape[0] // 2
+positive_embeds = encoder_hidden_states[half_batch:]
+current_id_embeds = positive_embeds[:, start_idx:end_idx, :]
+current_id_norm = torch.norm(current_id_embeds.view(-1)).item()
+if current_id_norm > 0:
+normalization_factor = first_id_norm / current_id_norm
+first_id_embeds_device = first_id_embeds.to(positive_embeds.device).to(positive_embeds.dtype)
+if first_id_embeds_device.shape[0] == 1 and half_batch > 1:
+first_id_embeds_device = first_id_embeds_device.expand(half_batch, -1, -1)
+positive_embeds[:, start_idx:end_idx, :] = first_id_embeds_device
+if start_idx > 0:
+positive_embeds[:, :start_idx, :] = positive_embeds[:, :start_idx, :] * normalization_factor
+if end_idx < positive_embeds.shape[1]:
+positive_embeds[:, end_idx:, :] = positive_embeds[:, end_idx:, :] * normalization_factor
+else:
+current_id_embeds = encoder_hidden_states[:, start_idx:end_idx, :]
+current_id_norm = torch.norm(current_id_embeds.view(-1)).item()
+if current_id_norm > 0:
+normalization_factor = first_id_norm / current_id_norm
+first_id_embeds_device = first_id_embeds.to(encoder_hidden_states.device).to(encoder_hidden_states.dtype)
+if first_id_embeds_device.shape[0] == 1 and encoder_hidden_states.shape[0] > 1:
+first_id_embeds_device = first_id_embeds_device.expand(encoder_hidden_states.shape[0], -1, -1)
+encoder_hidden_states[:, start_idx:end_idx, :] = first_id_embeds_device
+if start_idx > 0:
+encoder_hidden_states[:, :start_idx, :] = encoder_hidden_states[:, :start_idx, :] * normalization_factor
+if end_idx < encoder_hidden_states.shape[1]:
+encoder_hidden_states[:, end_idx:, :] = encoder_hidden_states[:, end_idx:, :] * normalization_factor
+q = self.to_q(hidden_states)
+k = (
+self.to_k(encoder_hidden_states)
+if encoder_hidden_states is not None
+else self.to_k(hidden_states)
+)
+v = (
+self.to_v(encoder_hidden_states)
+if encoder_hidden_states is not None
+else self.to_v(hidden_states)
+)
+b, t, c = q.size()
+q = q.view(q.size(0), q.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+k = k.view(k.size(0), k.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+v = v.view(v.size(0), v.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+is_self_attention = (encoder_hidden_states is None)
+if (unet_controller is not None and
+unet_controller.Use_kv_interpolation and
+is_self_attention and
+unet_controller.current_time_step is not None):
+timestep = unet_controller.current_time_step
+unet_position = unet_controller.current_unet_position
+position_prefix = None
+if unet_position:
+if unet_position.startswith('down'):
+position_prefix = 'down'
+elif unet_position.startswith('up'):
+position_prefix = 'up'
+elif unet_position.startswith('mid'):
+position_prefix = 'mid'
+in_timestep_range = (
+timestep >= unet_controller.Kv_interpolation_start_step and
+timestep <= unet_controller.Kv_interpolation_end_step
+)
+position_allowed = (
+position_prefix is not None and
+position_prefix in unet_controller.Kv_interpolation_position
+)
+if position_allowed and in_timestep_range:
+if unet_controller.current_frame_index == 0:
+unet_controller.save_first_frame_kv(
+k=k, v=v,
+timestep=timestep,
+unet_position=unet_position,
+layer_idx=layer_idx
+)
+else:
+first_k, first_v = unet_controller.get_first_frame_kv(
+timestep=timestep,
+unet_position=unet_position,
+layer_idx=layer_idx
+)
+if first_k is not None and first_v is not None:
+if (first_k.shape == k.shape and first_v.shape == v.shape):
+alpha = unet_controller.Kv_interpolation_alpha
+k = alpha * k + (1 - alpha) * first_k.to(k.device).to(k.dtype)
+v = alpha * v + (1 - alpha) * first_v.to(v.device).to(v.dtype)
+is_self_attention = (encoder_hidden_states is None)
+if (unet_controller is not None and
+unet_controller.Use_kv_concat and
+is_self_attention and
+unet_controller.current_time_step is not None):
+timestep = unet_controller.current_time_step
+unet_position = unet_controller.current_unet_position
+position_prefix = None
+if unet_position:
+if unet_position.startswith('down'):
+position_prefix = 'down'
+elif unet_position.startswith('up'):
+position_prefix = 'up'
+elif unet_position.startswith('mid'):
+position_prefix = 'mid'
+in_timestep_range = (
+timestep >= unet_controller.Kv_concat_start_step and
+timestep <= unet_controller.Kv_concat_end_step
+)
+position_allowed = (
+position_prefix is not None and
+position_prefix in unet_controller.Kv_concat_position
+)
+if position_allowed and in_timestep_range:
+unet_controller.save_frame_kv(
+k=k, v=v,
+timestep=timestep,
+unet_position=unet_position,
+layer_idx=layer_idx
+)
+if unet_controller.current_frame_index > 0:
+previous_k, previous_v = unet_controller.get_previous_frames_kv(
+q=q,
+timestep=timestep,
+unet_position=unet_position,
+layer_idx=layer_idx,
+sampling_rate=unet_controller.Kv_concat_sampling_rate,
+scale=self.scale
+)
+if previous_k is not None and previous_v is not None:
+if (previous_k.shape[0] == k.shape[0] and
+previous_k.shape[1] == k.shape[1] and
+previous_k.shape[3] == k.shape[3] and
+previous_v.shape[0] == v.shape[0] and
+previous_v.shape[1] == v.shape[1] and
+previous_v.shape[3] == v.shape[3]):
+previous_k = previous_k.to(k.device).to(k.dtype)
+previous_v = previous_v.to(v.device).to(v.dtype)
+k = torch.cat([previous_k, k], dim=2)
+v = torch.cat([previous_v, v], dim=2)
+scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+is_self_attention = (encoder_hidden_states is None)
+scores_before = None
+if (unet_controller is not None and
+unet_controller.Visualize_modulation_scores and
+unet_controller.Use_mask_modulation and
+unet_controller.current_time_step is not None and
+unet_controller.current_unet_position in unet_controller.Modulation_scores_vis_positions and
+unet_controller.current_attn_idx_in_block is not None and
+unet_controller.current_attn_idx_in_block in unet_controller.Modulation_scores_vis_layer_indices):
+batch_size = scores.shape[0]
+half_batch = batch_size // 2
+if (unet_controller.do_classifier_free_guidance and batch_size >= 2):
+scores_before = scores[half_batch:].detach().cpu()
+else:
+scores_before = scores.detach().cpu()
+if (unet_controller is not None and
+unet_controller.Use_mask_modulation and
+unet_controller.current_time_step is not None):
+total_steps = 50
+timestep = unet_controller.current_time_step
+if isinstance(timestep, torch.Tensor):
+current_step = timestep.item() if timestep.numel() == 1 else int(timestep[0].item())
+else:
+current_step = int(timestep)
+max_modulation_steps = int(total_steps * unet_controller.Mask_modulation_part)
+if current_step < max_modulation_steps:
+scores_dtype = scores.dtype
+scores_device = scores.device
+if isinstance(timestep, torch.Tensor):
+treg = torch.pow(timestep.float() / float(total_steps), 1)
+else:
+treg = torch.pow(torch.tensor(float(timestep) / float(total_steps), dtype=torch.float32), 1)
+treg = treg.to(device=scores_device, dtype=scores_dtype)
+batch_size = scores.shape[0]
+half_batch = batch_size // 2
+if (unet_controller.do_classifier_free_guidance and batch_size >= 2):
+scores_to_modulate = scores[half_batch:]
+else:
+scores_to_modulate = scores
+seq_len_q = scores_to_modulate.shape[-2]
+seq_len_k = scores_to_modulate.shape[-1]
+mask = create_rectangular_mask(
+seq_len_q,
+unet_controller.Mask_coords,
+scores_device,
+scores_dtype
+)
+mask_expanded = mask.view(1, 1, seq_len_q, 1)
+if not is_self_attention and unet_controller.subject_text is not None and unet_controller.tokenizer is not None and unet_controller.prompts is not None:
+prompt_tokens = utils.prompt2tokens(unet_controller.tokenizer, unet_controller.prompts[0])
+subject_tokens = utils.prompt2tokens(unet_controller.tokenizer, unet_controller.subject_text)
+subject_tokens = [word for word in subject_tokens if word != '<|endoftext|>' and word != '<|startoftext|>']
+index_of_subject = utils.find_sublist_index(prompt_tokens, subject_tokens)
+if index_of_subject != -1:
+subject_token_indices = list(range(index_of_subject, index_of_subject + len(subject_tokens)))
+subject_token_indices = [idx for idx in subject_token_indices if 0 <= idx < seq_len_k]
+if len(subject_token_indices) > 0:
+key_mask = torch.zeros(seq_len_k, device=scores_device, dtype=scores_dtype)
+key_mask[subject_token_indices] = 1.0
+key_mask_expanded = key_mask.view(1, 1, 1, seq_len_k)
+min_value = scores_to_modulate.min(dim=-1, keepdim=True)[0]
+max_value = scores_to_modulate.max(dim=-1, keepdim=True)[0]
+reg = float(unet_controller.Mask_modulation_reg)
+size_reg = 1.0
+modulation_factor = size_reg * reg * treg
+modulation_mask = (key_mask_expanded > 0).to(dtype=scores_dtype)
+modulation_mask_inv = (key_mask_expanded <= 0).to(dtype=scores_dtype)
+scores_to_modulate = scores_to_modulate + (
+mask_expanded * modulation_mask * modulation_factor * (max_value - scores_to_modulate)
+)
+scores_to_modulate = scores_to_modulate - (
+(1 - mask_expanded) * modulation_mask * modulation_factor * (scores_to_modulate - min_value)
+)
+else:
+pass
+else:
+pass
+else:
+mask = create_rectangular_mask(
+seq_len_q,
+unet_controller.Mask_coords,
+scores_device,
+scores_dtype
+)
+mask_expanded = mask.view(1, 1, seq_len_q, 1)
+min_value = scores_to_modulate.min(dim=-1, keepdim=True)[0]
+max_value = scores_to_modulate.max(dim=-1, keepdim=True)[0]
+reg = float(unet_controller.Mask_modulation_reg)
+size_reg = 1.0
+modulation_mask = (mask_expanded > 0).to(dtype=scores_dtype)
+modulation_mask_inv = (mask_expanded <= 0).to(dtype=scores_dtype)
+modulation_factor = size_reg * reg * treg
+count = torch.sum(mask_expanded).item()
+scores_to_modulate = scores_to_modulate + (
+modulation_mask * modulation_factor * (max_value - scores_to_modulate)
+)
+scores_to_modulate = scores_to_modulate - (
+modulation_mask_inv * modulation_factor * (scores_to_modulate - min_value)
+)
+scores_to_modulate = scores_to_modulate.to(dtype=scores_dtype)
+if (unet_controller is not None and
+unet_controller.Visualize_modulation_scores and
+unet_controller.current_unet_position in unet_controller.Modulation_scores_vis_positions and
+unet_controller.current_attn_idx_in_block is not None and
+unet_controller.current_attn_idx_in_block in unet_controller.Modulation_scores_vis_layer_indices):
+scores_after = scores_to_modulate.detach().cpu()
+if scores_before is not None and unet_controller.result_save_dir is not None:
+unet_position = unet_controller.current_unet_position if unet_controller.current_unet_position else "unknown"
+timestep = unet_controller.current_time_step
+if isinstance(timestep, torch.Tensor):
+timestep = timestep.item() if timestep.numel() == 1 else int(timestep[0].item())
+else:
+timestep = int(timestep)
+scores_before_avg = scores_before.mean(dim=(0, 1))
+scores_after_avg = scores_after.mean(dim=(0, 1))
+import os
+instance_id = os.path.basename(os.path.normpath(unet_controller.result_save_dir))
+modulation_vis_dir = os.path.join("result", "Attention-modulation-visualization-part0.5-reg5.0-factor1.0-subMask+attenMask-tregpow1up-test", instance_id)
+block_position = f"{unet_position}_{'self' if is_self_attention else 'cross'}_{layer_idx}"
+frame_index = getattr(unet_controller, 'current_frame_index', None)
+prompt = None
+if unet_controller.prompts is not None and len(unet_controller.prompts) > 0:
+prompt = unet_controller.prompts[0]
+utils.save_single_modulation_score(
+before_scores=scores_before_avg,
+after_scores=scores_after_avg,
+timestep=timestep,
+block_position=block_position,
+save_dir=modulation_vis_dir,
+frame_index=frame_index,
+is_cross_attention=not is_self_attention,
+tokenizer=unet_controller.tokenizer,
+prompt=prompt
+)
+if (unet_controller.do_classifier_free_guidance and batch_size >= 2):
+scores = torch.cat([scores[:half_batch], scores_to_modulate], dim=0)
+else:
+scores = scores_to_modulate
+else:
+if (unet_controller is not None and
+unet_controller.Visualize_modulation_scores and
+scores_before is not None and
+unet_controller.current_unet_position in unet_controller.Modulation_scores_vis_positions and
+unet_controller.current_attn_idx_in_block is not None and
+unet_controller.current_attn_idx_in_block in unet_controller.Modulation_scores_vis_layer_indices and
+unet_controller.result_save_dir is not None):
+unet_position = unet_controller.current_unet_position if unet_controller.current_unet_position else "unknown"
+timestep = unet_controller.current_time_step
+if isinstance(timestep, torch.Tensor):
+timestep = timestep.item() if timestep.numel() == 1 else int(timestep[0].item())
+else:
+timestep = int(timestep)
+scores_before_avg = scores_before.mean(dim=(0, 1))
+scores_after_avg = scores_before_avg.clone()
+import os
+instance_id = os.path.basename(os.path.normpath(unet_controller.result_save_dir))
+modulation_vis_dir = os.path.join("result", "Attention-modulation-visualization", instance_id)
+block_position = f"{unet_position}_{'self' if is_self_attention else 'cross'}_{layer_idx}"
+frame_index = getattr(unet_controller, 'current_frame_index', None)
+prompt = None
+if unet_controller.prompts is not None and len(unet_controller.prompts) > 0:
+prompt = unet_controller.prompts[0]
+utils.save_single_modulation_score(
+before_scores=scores_before_avg,
+after_scores=scores_after_avg,
+timestep=timestep,
+block_position=block_position,
+save_dir=modulation_vis_dir,
+frame_index=frame_index,
+is_cross_attention=not is_self_attention,
+tokenizer=unet_controller.tokenizer,
+prompt=prompt
+)
+if (unet_controller is not None and unet_controller.Use_ipca and unet_controller.current_unet_position in unet_controller.Ipca_position
+and encoder_hidden_states is not None and unet_controller.current_time_step >= unet_controller.Ipca_start_step):
+if unet_controller.do_classifier_free_guidance is True:
+attn_weights = torch.softmax(scores, dim=-1)
+if unet_controller is not None and unet_controller.Visualize_attn_map and is_cross:
+unet_controller.save_attn_map(
+attn_weights=attn_weights,
+place_in_unet=unet_controller.current_unet_position
+)
+ipca_attn_output = utils.ipca2(q,k,v,self.scale,unet_controller=unet_controller)
+attn_output = ipca_attn_output
+else:
+exit("current doesn't support cfg=1.0")
+else:
+attn_weights = torch.softmax(scores, dim=-1)
+if unet_controller is not None:
+is_cross = (encoder_hidden_states is not None)
+unet_controller.save_attn_map(
+attn_weights=attn_weights,
+is_cross=is_cross,
+place_in_unet=unet_controller.current_unet_position
+)
+attn_output = torch.matmul(attn_weights, v)
+attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, c)
+for layer in self.to_out:
+attn_output = layer(attn_output)
+return attn_output
+class GEGLU(nn.Module):
+def __init__(self, in_features, out_features):
+super(GEGLU, self).__init__()
+self.proj = nn.Linear(in_features, out_features * 2, bias=True)
+def forward(self, x):
+x_proj = self.proj(x)
+x1, x2 = x_proj.chunk(2, dim=-1)
+return x1 * torch.nn.functional.gelu(x2)
+class FeedForward(nn.Module):
+def __init__(self, in_features, out_features):
+super(FeedForward, self).__init__()
+self.net = nn.ModuleList(
+[
+GEGLU(in_features, out_features * 4),
+nn.Dropout(p=0.0, inplace=False),
+nn.Linear(out_features * 4, out_features, bias=True),
+]
+)
+def forward(self, x):
+for layer in self.net:
+x = layer(x)
+return x
+class BasicTransformerBlock(nn.Module):
+def __init__(self, hidden_size):
+super(BasicTransformerBlock, self).__init__()
+self.norm1 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+self.attn1 = Attention(hidden_size)
+self.norm2 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+self.attn2 = Attention(hidden_size, 2048)
+self.norm3 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+self.ff = FeedForward(hidden_size, hidden_size)
+def forward(self, x, encoder_hidden_states=None, unet_controller: Optional[UNetController] = None, layer_idx: int = 0):
+residual = x
+x = self.norm1(x)
+x = self.attn1(x, unet_controller=unet_controller, layer_idx=layer_idx * 2)
+x = x + residual
+residual = x
+x = self.norm2(x)
+if encoder_hidden_states is not None:
+x = self.attn2(x, encoder_hidden_states, unet_controller=unet_controller, layer_idx=layer_idx * 2 + 1)
+else:
+x = self.attn2(x, unet_controller=unet_controller, layer_idx=layer_idx * 2 + 1)
+x = x + residual
+residual = x
+x = self.norm3(x)
+x = self.ff(x)
+x = x + residual
+return x
+class Transformer2DModel(nn.Module):
+def __init__(self, in_channels, out_channels, n_layers):
+super(Transformer2DModel, self).__init__()
+self.norm = nn.GroupNorm(32, in_channels, eps=1e-06, affine=True)
+self.proj_in = nn.Linear(in_channels, out_channels, bias=True)
+self.transformer_blocks = nn.ModuleList(
+[BasicTransformerBlock(out_channels) for _ in range(n_layers)]
+)
+self.proj_out = nn.Linear(out_channels, out_channels, bias=True)
+def forward(self, hidden_states, encoder_hidden_states=None, unet_controller: Optional[UNetController] = None):
+batch, _, height, width = hidden_states.shape
+res = hidden_states
+hidden_states = self.norm(hidden_states)
+inner_dim = hidden_states.shape[1]
+hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(
+batch, height * width, inner_dim
+)
+hidden_states = self.proj_in(hidden_states)
+for block_idx, block in enumerate(self.transformer_blocks):
+hidden_states = block(hidden_states, encoder_hidden_states, unet_controller=unet_controller, layer_idx=block_idx)
+hidden_states = self.proj_out(hidden_states)
+hidden_states = (
+hidden_states.reshape(batch, height, width, inner_dim)
+.permute(0, 3, 1, 2)
+.contiguous()
+)
+return hidden_states + res
+class Downsample2D(nn.Module):
+def __init__(self, in_channels, out_channels):
+super(Downsample2D, self).__init__()
+self.conv = nn.Conv2d(
+in_channels, out_channels, kernel_size=3, stride=2, padding=1
+)
+def forward(self, x):
+return self.conv(x)
+class Upsample2D(nn.Module):
+def __init__(self, in_channels, out_channels):
+super(Upsample2D, self).__init__()
+self.conv = nn.Conv2d(
+in_channels, out_channels, kernel_size=3, stride=1, padding=1
+)
+def forward(self, x):
+x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+return self.conv(x)
+class DownBlock2D(nn.Module):
+def __init__(self, in_channels, out_channels):
+super(DownBlock2D, self).__init__()
+self.resnets = nn.ModuleList(
+[
+ResnetBlock2D(in_channels, out_channels, conv_shortcut=False),
+ResnetBlock2D(out_channels, out_channels, conv_shortcut=False),
+]
+)
+self.downsamplers = nn.ModuleList([Downsample2D(out_channels, out_channels)])
+def forward(self, hidden_states, temb):
+output_states = []
+for module in self.resnets:
+hidden_states = module(hidden_states, temb)
+output_states.append(hidden_states)
+hidden_states = self.downsamplers[0](hidden_states)
+output_states.append(hidden_states)
+return hidden_states, output_states
+class CrossAttnDownBlock2D(nn.Module):
+def __init__(self, in_channels, out_channels, n_layers, has_downsamplers=True):
+super(CrossAttnDownBlock2D, self).__init__()
+self.attentions = nn.ModuleList(
+[
+Transformer2DModel(out_channels, out_channels, n_layers),
+Transformer2DModel(out_channels, out_channels, n_layers),
+]
+)
+self.resnets = nn.ModuleList(
+[
+ResnetBlock2D(in_channels, out_channels),
+ResnetBlock2D(out_channels, out_channels, conv_shortcut=False),
+]
+)
+self.downsamplers = None
+if has_downsamplers:
+self.downsamplers = nn.ModuleList(
+[Downsample2D(out_channels, out_channels)]
+)
+def forward(self, hidden_states, temb, encoder_hidden_states, unet_controller: Optional[UNetController] = None):
+output_states = []
+for resnet, attn in zip(self.resnets, self.attentions):
+hidden_states = resnet(hidden_states, temb)
+hidden_states = attn(
+hidden_states,
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+output_states.append(hidden_states)
+if self.downsamplers is not None:
+hidden_states = self.downsamplers[0](hidden_states)
+output_states.append(hidden_states)
+return hidden_states, output_states
+class CrossAttnUpBlock2D(nn.Module):
+def __init__(self, in_channels, out_channels, prev_output_channel, n_layers):
+super(CrossAttnUpBlock2D, self).__init__()
+self.attentions = nn.ModuleList(
+[
+Transformer2DModel(out_channels, out_channels, n_layers),
+Transformer2DModel(out_channels, out_channels, n_layers),
+Transformer2DModel(out_channels, out_channels, n_layers),
+]
+)
+self.resnets = nn.ModuleList(
+[
+ResnetBlock2D(prev_output_channel + out_channels, out_channels),
+ResnetBlock2D(2 * out_channels, out_channels),
+ResnetBlock2D(out_channels + in_channels, out_channels),
+]
+)
+self.upsamplers = nn.ModuleList([Upsample2D(out_channels, out_channels)])
+def forward(
+self, hidden_states, res_hidden_states_tuple, temb, encoder_hidden_states, unet_controller: Optional[UNetController] = None,
+):
+for attn_idx, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
+res_hidden_states = res_hidden_states_tuple[-1]
+res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+if unet_controller is not None and unet_controller.Is_freeu_enabled:
+hidden_states, res_hidden_states = utils.apply_freeu(
+0 if unet_controller.current_unet_position == 'up0' else 1,
+hidden_states,
+res_hidden_states,
+s1=unet_controller.Freeu_parm['s1'],
+s2=unet_controller.Freeu_parm['s2'],
+b1=unet_controller.Freeu_parm['b1'],
+b2=unet_controller.Freeu_parm['b2'],
+)
+hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+hidden_states = resnet(hidden_states, temb)
+if unet_controller is not None:
+unet_controller.current_attn_idx_in_block = attn_idx
+hidden_states = attn(
+hidden_states,
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_attn_idx_in_block = None
+if self.upsamplers is not None:
+for upsampler in self.upsamplers:
+hidden_states = upsampler(hidden_states)
+return hidden_states
+class UpBlock2D(nn.Module):
+def __init__(self, in_channels, out_channels, prev_output_channel):
+super(UpBlock2D, self).__init__()
+self.resnets = nn.ModuleList(
+[
+ResnetBlock2D(out_channels + prev_output_channel, out_channels),
+ResnetBlock2D(out_channels * 2, out_channels),
+ResnetBlock2D(out_channels + in_channels, out_channels),
+]
+)
+def forward(self, hidden_states, res_hidden_states_tuple, temb=None):
+for resnet in self.resnets:
+res_hidden_states = res_hidden_states_tuple[-1]
+res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+hidden_states = resnet(hidden_states, temb)
+return hidden_states
+class UNetMidBlock2DCrossAttn(nn.Module):
+def __init__(self, in_features):
+super(UNetMidBlock2DCrossAttn, self).__init__()
+self.attentions = nn.ModuleList(
+[Transformer2DModel(in_features, in_features, n_layers=10)]
+)
+self.resnets = nn.ModuleList(
+[
+ResnetBlock2D(in_features, in_features, conv_shortcut=False),
+ResnetBlock2D(in_features, in_features, conv_shortcut=False),
+]
+)
+def forward(self, hidden_states, temb=None, encoder_hidden_states=None, unet_controller: Optional[UNetController] = None):
+hidden_states = self.resnets[0](hidden_states, temb)
+for attn, resnet in zip(self.attentions, self.resnets[1:]):
+hidden_states = attn(
+hidden_states,
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+hidden_states = resnet(hidden_states, temb)
+return hidden_states
+class UNet2DConditionModel(ModelMixin, ConfigMixin):
+def __init__(self):
+super(UNet2DConditionModel, self).__init__()
+self.conv_in = nn.Conv2d(4, 320, kernel_size=3, stride=1, padding=1)
+self.time_proj = Timesteps()
+self.time_embedding = TimestepEmbedding(in_features=320, out_features=1280)
+self.add_time_proj = Timesteps(256)
+self.add_embedding = TimestepEmbedding(in_features=2816, out_features=1280)
+self.down_blocks = nn.ModuleList(
+[
+DownBlock2D(in_channels=320, out_channels=320),
+CrossAttnDownBlock2D(in_channels=320, out_channels=640, n_layers=2),
+CrossAttnDownBlock2D(
+in_channels=640,
+out_channels=1280,
+n_layers=10,
+has_downsamplers=False,
+),
+]
+)
+self.up_blocks = nn.ModuleList(
+[
+CrossAttnUpBlock2D(
+in_channels=640,
+out_channels=1280,
+prev_output_channel=1280,
+n_layers=10,
+),
+CrossAttnUpBlock2D(
+in_channels=320,
+out_channels=640,
+prev_output_channel=1280,
+n_layers=2,
+),
+UpBlock2D(in_channels=320, out_channels=320, prev_output_channel=640),
+]
+)
+self.mid_block = UNetMidBlock2DCrossAttn(1280)
+self.conv_norm_out = nn.GroupNorm(32, 320, eps=1e-05, affine=True)
+self.conv_act = nn.SiLU()
+self.conv_out = nn.Conv2d(320, 4, kernel_size=3, stride=1, padding=1)
+def forward(
+self, sample, timesteps, encoder_hidden_states, added_cond_kwargs, unet_controller: Optional[UNetController] = None, **kwargs
+):
+timesteps = timesteps.expand(sample.shape[0])
+t_emb = self.time_proj(timesteps).to(dtype=sample.dtype)
+emb = self.time_embedding(t_emb)
+text_embeds = added_cond_kwargs.get("text_embeds")
+time_ids = added_cond_kwargs.get("time_ids")
+time_embeds = self.add_time_proj(time_ids.flatten())
+time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+add_embeds = add_embeds.to(emb.dtype)
+aug_emb = self.add_embedding(add_embeds)
+emb = emb + aug_emb
+sample = self.conv_in(sample)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'down0'
+s0 = sample
+sample, [s1, s2, s3] = self.down_blocks[0](
+sample,
+temb=emb,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'down1'
+sample, [s4, s5, s6] = self.down_blocks[1](
+sample,
+temb=emb,
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'down2'
+sample, [s7, s8] = self.down_blocks[2](
+sample,
+temb=emb,
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'mid'
+sample = self.mid_block(
+sample, emb, encoder_hidden_states=encoder_hidden_states, unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'up0'
+sample = self.up_blocks[0](
+hidden_states=sample,
+temb=emb,
+res_hidden_states_tuple=[s6, s7, s8],
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'up1'
+sample = self.up_blocks[1](
+hidden_states=sample,
+temb=emb,
+res_hidden_states_tuple=[s3, s4, s5],
+encoder_hidden_states=encoder_hidden_states,
+unet_controller=unet_controller,
+)
+if unet_controller is not None:
+unet_controller.current_unet_position = 'up2'
+sample = self.up_blocks[2](
+hidden_states=sample,
+temb=emb,
+res_hidden_states_tuple=[s0, s1, s2],
+)
+sample = self.conv_norm_out(sample)
+sample = self.conv_act(sample)
+sample = self.conv_out(sample)
+return [sample]

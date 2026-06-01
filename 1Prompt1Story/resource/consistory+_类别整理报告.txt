@@ -1,0 +1,253 @@
+============================================================
+consistory+.yaml 类别整理报告
+============================================================
+
+【类别总览】
+------------------------------------------------------------
+  animals        :  21 个条目
+  fairy_tales    :  40 个条目
+  fantasy        :  22 个条目
+  foods          :  20 个条目
+  humans         :  21 个条目
+  inanimate      :  18 个条目
+  nature         :  41 个条目
+  technoledge    :   9 个条目
+
+总计: 192 个条目，共 8 个类别
+
+【类别内重复概念】
+------------------------------------------------------------
+
+animals:
+  - cat (2次)
+  - cheetah (2次)
+  - dog (3次)
+  - kitten (2次)
+  - puppy (3次)
+  - zebra (2次)
+
+fairy_tales:
+  - elf (2次)
+  - fairy (2次)
+  - faun (2次)
+  - gnome (2次)
+  - goblin (3次)
+  - ogre (2次)
+  - phoenix (2次)
+  - princess (2次)
+  - troll (4次)
+  - unicorn (2次)
+  - witch (4次)
+  - wizard (2次)
+
+fantasy:
+  - fairy (3次)
+  - goblin (2次)
+  - leprechaun (2次)
+  - mermaid (2次)
+
+humans:
+  - gentleman (2次)
+  - girl (2次)
+  - lawyer (2次)
+  - scientist (2次)
+  - woman (4次)
+
+inanimate:
+  - dog (2次)
+
+nature:
+  - butterfly (3次)
+  - coral (2次)
+  - oak (2次)
+
+technoledge:
+  - robotic dog (2次)
+  - robotic wolf (2次)
+
+【跨类别重复概念】
+------------------------------------------------------------
+  butterfly           : 出现在 2 个类别 - ['nature', 'inanimate']
+  centaur             : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  cupcake             : 出现在 2 个类别 - ['inanimate', 'foods']
+  dog                 : 出现在 2 个类别 - ['animals', 'inanimate']
+  dwarf               : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  elf                 : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  fairy               : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  goblin              : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  griffin             : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  hedgehog            : 出现在 2 个类别 - ['nature', 'animals']
+  ogre                : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  phoenix             : 出现在 2 个类别 - ['fairy_tales', 'animals']
+  rainbow             : 出现在 2 个类别 - ['nature', 'inanimate']
+  siren               : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  troll               : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  unicorn             : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+  wizard              : 出现在 2 个类别 - ['fairy_tales', 'fantasy']
+
+【各类别概念列表】
+------------------------------------------------------------
+
+ANIMALS:
+  - cat (2次)
+  - cheetah (2次)
+  - dog (3次)
+  - fox
+  - gorilla
+  - hedgehog
+  - horse
+  - kitten (2次)
+  - parrot
+  - phoenix
+  - puppy (3次)
+  - walrus
+  - zebra (2次)
+
+FAIRY_TALES:
+  - centaur
+  - dryad
+  - dwarf
+  - elf (2次)
+  - fairy (2次)
+  - fairy godmother
+  - faun (2次)
+  - gnome (2次)
+  - goblin (3次)
+  - griffin
+  - magic book
+  - nymph
+  - ogre (2次)
+  - pegasus
+  - phoenix (2次)
+  - princess (2次)
+  - satyr
+  - siren
+  - snow queen
+  - troll (4次)
+  - unicorn (2次)
+  - witch (4次)
+  - wizard (2次)
+
+FANTASY:
+  - centaur
+  - dwarf
+  - elf
+  - elf queen
+  - fairy (3次)
+  - goblin (2次)
+  - griffin
+  - hobbit
+  - leprechaun (2次)
+  - mermaid (2次)
+  - ogre
+  - siren
+  - sorceress
+  - troll
+  - unicorn
+  - werewolf
+  - wizard
+
+FOODS:
+  - Caesar salad
+  - bagel
+  - bowl of chili
+  - bowl of gazpacho
+  - bowl of pad thai
+  - bowl of poke
+  - bowl of ramen
+  - cheesecake
+  - chocolate cake
+  - croissant
+  - cupcake
+  - fried rice
+  - hot chocolate
+  - ice cream sundae
+  - loaf of bread
+  - lobster roll
+  - macaron
+  - plate of pasta
+  - salad
+  - spaghetti
+
+HUMANS:
+  - barber
+  - boy
+  - child
+  - dancer
+  - dentist
+  - gardener
+  - gentleman (2次)
+  - girl (2次)
+  - lawyer (2次)
+  - optometrist
+  - scientist (2次)
+  - tailor
+  - waiter
+  - woman (4次)
+
+INANIMATE:
+  - apple
+  - balloon
+  - bird
+  - butterfly
+  - cloud
+  - cupcake
+  - dog (2次)
+  - guitar
+  - hamburger
+  - lamp
+  - mug
+  - pin
+  - rainbow
+  - sofa
+  - starfish
+  - sun
+  - umbrella
+
+NATURE:
+  - aurora
+  - bamboo
+  - butterfly (3次)
+  - coconut tree
+  - coral (2次)
+  - daisy
+  - deer
+  - dolphin
+  - dragonfly
+  - eagle
+  - fern
+  - glacier
+  - hedgehog
+  - hummingbird
+  - lavender
+  - lily
+  - lily pad
+  - maple leaf
+  - moss
+  - mushroom
+  - oak (2次)
+  - oak leaf
+  - owl
+  - peacock
+  - pine
+  - polar bear
+  - rainbow
+  - raven
+  - seagull
+  - snow leopard
+  - stag
+  - sunflower
+  - sunflower field
+  - tide pool
+  - waterfall
+  - waterfall mist
+  - willow
+
+TECHNOLEDGE:
+  - delivery robot
+  - robotic cheetah
+  - robotic dog (2次)
+  - robotic elephant
+  - robotic horse
+  - robotic rabbit
+  - robotic wolf (2次)

@@ -1,0 +1,205 @@
+animals:
+- concept_token: phoenix
+  settings:
+  - rising from a fiery ashes
+  - soaring through a glowing sky
+  - perching on a mountain peak
+  - singing a haunting melody
+  - igniting flames with its wings
+  style: A fiery and majestic illustration of
+  subject: A phoenix with bright orange feathers
+- concept_token: zebra
+  settings:
+  - grazing alongside a river
+  - running in a herd across the plains
+  - resting under the shade of an acacia tree
+  - crossing a dusty path in the wild
+  - protecting its young in the savannah
+  style: A vibrant and striking portrait of
+  subject: A zebra with black and white stripes
+- concept_token: cheetah
+  settings:
+  - sprinting across the savannah
+  - stalking a gazelle in the grass
+  - relaxing in the shade under a tree
+  - marking territory with its scent
+  - napping after a successful hunt
+  style: A sleek and fast depiction of
+  subject: A cheetah with sharp eyes
+- concept_token: walrus
+  settings:
+  - lounging on an ice floe
+  - diving for clams in the sea
+  - bellowing from the shore
+  - resting near a snowy coastline
+  - swimming gracefully in the ocean
+  style: A massive and majestic depiction of
+  subject: A walrus with large tusks
+- concept_token: zebra
+  settings:
+  - grazing under the sun in the savannah
+  - running with a herd through the grasslands
+  - standing near a watering hole
+  - crossing a river in the wild
+  - trotting beside a wildebeest
+  style: A bold and striking illustration of
+  subject: A zebra with black and white stripes
+- concept_token: cheetah
+  settings:
+  - sprinting at top speed in the savannah
+  - resting in the shade of a tree
+  - hunting a gazelle in tall grass
+  - stretching before a sprint
+  - watching the horizon from a hill
+  style: A sleek and fast portrayal of
+  subject: A cheetah with spotted fur
+- concept_token: gorilla
+  settings:
+  - sitting in a jungle clearing
+  - playing with a baby gorilla
+  - searching for fruit in the trees
+  - relaxing by a waterfall
+  - beating its chest to assert dominance
+  style: A strong and wise illustration of
+  subject: A gorilla with dark fur
+- concept_token: dog
+  settings:
+  - chasing a frisbee
+  - dressed in a raincoat
+  - in a city alley
+  - jumping over a puddle
+  - at a veterinarian's office
+  - playing in a park
+  - sleeping on a couch
+  - running on a beach
+  style: A hyper-realistic digital painting of
+  subject: A dog
+- concept_token: parrot
+  settings:
+  - in a tropical rainforest
+  - singing a song
+  - on the water
+  - sitting on a rock
+  - in a rain storm
+  - perched on a branch
+  - eating fruit
+  style: A watercolor illustration of
+  subject: A Scarlet parrot with vibrant red, yellow, and blue feathers
+- concept_token: dog
+  settings:
+  - wearing a bandana
+  - on a beach
+  - in a city alley
+  - in a snowy backyard
+  - at a veterinarian's office
+  - playing with a toy
+  - barking at a squirrel
+  style: A 3D animation of
+  subject: A black and white dog with yellow collar
+- concept_token: fox
+  settings:
+  - wearing a scarf
+  - dressed in a warm coat
+  - wearing a playful bow
+  - resting in a den
+  - near a campsite
+  - exploring a forest
+  - looking at the stars
+  style: A hyper-realistic digital painting of
+  subject: A red fox with a vibrant red coat, white belly, and bushy tail
+- concept_token: puppy
+  settings:
+  - in a pet store
+  - eating his food
+  - wearing a training harness
+  - dressed in a bandana
+  - at a lake
+  - playing with a ball
+  - sleeping in a bed
+  style: A 3D animation of
+  subject: A cute Labrador puppy with a glossy, chocolate brown coat
+- concept_token: dog
+  settings:
+  - wearing a bandana
+  - biting a bone
+  - wearing a birthday hat
+  - in a snowy backyard
+  - sitting by a fireplace
+  style: A 3D animation of
+  subject: A black and white dog with yellow collar
+- concept_token: kitten
+  settings:
+  - in a garden
+  - dressed in a cute sweater
+  - wearing a collar with a bell
+  - dressed in a superhero cape
+  - running through a field
+  - playing with a toy
+  - sitting in a basket
+  style: A watercolor illustration of
+  subject: A cute kitten with sleek, cream-colored fur and striking blue eyes
+- concept_token: puppy
+  settings:
+  - in a pet store
+  - in a grassy yard
+  - wearing a training harness
+  - dressed in a bandana
+  - wearing a life vest
+  style: ''
+  subject: A puppy
+- concept_token: puppy
+  settings:
+  - wearing a small sweater
+  - digging a hole
+  - wearing a training harness
+  - sticking head out of the car window
+  - swimming
+  - playing in the yard
+  - chasing a ball
+  style: A watercolor illustration of
+  subject: A puppy
+- concept_token: cat
+  settings:
+  - playing with a yarn ball
+  - sleeping in a box
+  - wearing a fluffy collar
+  - climbing a tree
+  - sitting on a shelf
+  style: A hyper-realistic digital painting of
+  subject: A cat
+- concept_token: cat
+  settings:
+  - wearing a bow tie
+  - dressed in a Halloween costume
+  - in a busy alley
+  - on a sled
+  - wearing a small bell
+  style: A hyper-realistic digital painting of
+  subject: A cat
+- concept_token: kitten
+  settings:
+  - wearing a tiny hat
+  - on a couch
+  - in a hospital
+  - playing with a feather toy
+  - on a rooftop
+  style: ''
+  subject: A cute kitten with sleek, cream-colored fur and striking blue eyes
+- concept_token: hedgehog
+  settings:
+  - in a cozy nest
+  - dressed in a miniature jacket
+  - wearing a small collar
+  - dressed in a festive outfit
+  - wearing a flower crown
+  style: A 3D animation of
+  subject: A happy hedgehog
+- concept_token: horse
+  settings:
+  - in a stable
+  - jumping over a hurdle
+  - in a snowy field
+  - in a mountain trail
+  - in a busy street
+  style: A hyper-realistic digital painting of
+  subject: A Palomino horse with a golden coat and a flowing, white mane and tail

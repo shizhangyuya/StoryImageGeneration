@@ -1,0 +1,198 @@
+python resource/test_benchmark.py --folder ./result/benchmark_1p1s --prefix animals --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_1p1s --prefix animals --mode clip_image
+
+1p1s
+clip_Image clip_Text
+clip_image_total_avg_distance: 0.8986038095238097
+clip_text_total_avg_distance: 0.8921847619047621
+dreamsim_total_avg_distance: 0.22245238095238098
+
+python resource/test_benchmark.py --folder ./result/benchmark_interplation_0.5_up-mid-down --prefix animals --mode clip_image
+clip_image_total_avg_distance: 0.9046852380952379
+clip_text_total_avg_distance: 0.8141861904761905
+dreamsim_total_avg_distance: 0.17855761904761905
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory_kv+interpolation_0.4first_down+up_20-35steps/ --prefix animals --mode clip_text
+clip_image_total_avg_distance: 0.9024009533819532
+clip_text_total_avg_distance: 0.8858571428571428
+dreamsim_total_avg_distance: 0.21459999999999999
+
+python resource/test_benchmark.py --folder ./result/benchmark_atten+concat_0-40step_1.0token_down+up_test --prefix animals --mode clip_text no icpr
+clip_Image 0.8978338095238094
+clip_Text 0.8875919047619047
+dreamsim_total_avg_distance: 0.21823809523809526
+
+python resource/test_benchmark.py --folder ./result/benchmark_atten+concat_10-40step_0.8token_down+uptest --prefix animals --mode clip_image no icpr
+clip_image_total_avg_distance: 0.8959976190476189
+clip_text_total_avg_distance: 0.8919471428571429
+dreamsim_total_avg_distance: 0.21823809523809526
+
+python resource/test_benchmark.py --folder ./result/benchmark_refinedprompt_2 --prefix animals --mode clip_image
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory_refined_with_original_names --prefix animals --mode clip_image
+clip_image_total_avg_distance: 0.9152704761904761
+clip_text_total_avg_distance: 0.8674271428571428
+dreamsim_total_avg_distance: 0.16447666666666666
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory_box+modulation_5.0_steps0.5 --prefix animals --mode clip_image
+clip_image_total_avg_distance: 0.9006342857142855
+clip_text_total_avg_distance: 0.8939538095238097
+dreamsim_total_avg_distance: 0.2216147619047619
+
+拼图脚本
+python resource/merge_images.py ./result/benchmark_interplation_0.5_up-mid-down --prefix animals
+python resource/merge_images.py ./result/benchmark_1p1s
+python resource/merge_images.py ./result/benchmark_consistory+refined3+color+allprompts
+python resource/merge_images.py ./result/benchmark_consistory+refined3+color+allprompts+new_subject
+python resource/merge_images.py ./result/benchmark_consistory+mask-modulation-reg10.0-part0.6-subMask+attenMask-tregpow1-test
+
+python resource/test_benchmark.py --folder ./result/benchmark_1p1s --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_1p1s --mode clip_image
+python resource/test_benchmark.py --folder ./result/benchmark_1p1s --mode dreamsim
+clip_text_total_avg_distance: 0.8904892708333337
+clip_image_total_avg_distance: 0.9202925000000005
+dreamsim_total_avg_distance: 0.1737677083333334
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+ --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+ --mode clip_image
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+ --mode dreamsim
+clip_text_total_avg_distance: 0.8902137499999996
+clip_image_total_avg_distance: 0.9202338020833332
+dreamsim_total_avg_distance: 0.17397744791666667
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+refined3+color+allprompts+new_subject --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+refined3+color+allprompts+new_subject --mode clip_image
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+refined3+color+allprompts+new_subject --mode dreamsim
+clip_text_total_avg_distance: 0.8701660937499995
+clip_image_total_avg_distance: 0.9229703125000003
+dreamsim_total_avg_distance: 0.16074973958333338
+
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg5.0-factor1.0-subMask+attenMask-run3 --prefix animals --mode clip_image
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg5.0-factor1.0-subMask+attenMask-run3 --prefix animals --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg5.0-factor1.0-subMask+attenMask-run3 --prefix animals --mode dreamsim
+clip_text_total_avg_distance: 0.8941785714285715
+clip_image_total_avg_distance: 0.9009990476190478
+dreamsim_total_avg_distance: 0.22019428571428573
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg10.0-part0.3-subMask+attenMask-tregpow1up-test --prefix animals --mode clip_image
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg10.0-part0.3-subMask+attenMask-tregpow1up-test --prefix animals --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+mask-modulation-reg10.0-part0.3-subMask+attenMask-tregpow1up-test --prefix animals --mode dreamsim
+clip_image_total_avg_distance: 0.8682104761904762
+clip_text_total_avg_distance: 0.805944761904762
+dreamsim_total_avg_distance: 0.29421904761904766
+
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+refined3+color+allprompts+new_subject --new_subject --yaml_path resource/consistory+1p1s_allprompt_refined.yaml
+clip_text_total_avg_distance: 0.9048732812499999
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_1p1s --new_subject --yaml_path resource/consistory+1p1s_allprompt_refined.yaml
+
+
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+kv_concat_0.2rate_upblock_0-20step --prefix animals --mode clip_image
+Average distance for animals_0: 0.9511897742748261
+Average distance for animals_1: 0.9225368499755859
+Average distance for animals_2: 0.9340477049350738
+Average distance for animals_3: 0.9231008350849151
+Average distance for animals_4: 0.9350045919418335
+Average distance for animals_5: 0.9350047647953034
+Average distance for animals_6: 0.9617962419986725
+Average distance for animals_7: 0.8298228063753673
+Average distance for animals_8: 0.9429421842098236
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_1p1s --prefix animals --mode clip_image
+Average distance for animals_0: 0.9523501753807068
+Average distance for animals_1: 0.899019968509674
+Average distance for animals_2: 0.9595071732997894
+Average distance for animals_3: 0.9234769165515899
+Average distance for animals_4: 0.93109170794487
+Average distance for animals_5: 0.9469088196754456
+Average distance for animals_6: 0.94919753074646
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+kv_concat_0.2rate_upblock_0-20step --prefix animals --mode clip_text
+python resource/test_benchmark.py --folder ./result/benchmark_consistory+kv_concat_0.2rate_upblock_0-20step --prefix animals --mode dreamsim
+
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock --prefix animals --mode clip_image
+Average distance for animals_0: 0.9523956179618835
+Average distance for animals_1: 0.9008346021175384
+Average distance for animals_2: 0.9595204353332519
+Average distance for animals_3: 0.9206456005573272
+Average distance for animals_4: 0.9278188943862915
+
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_test2 --prefix animals --mode clip_image
+benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_test2
+Average distance for animals_0: 0.9629160165786743
+Average distance for animals_1: 0.8998769342899322
+Average distance for animals_2: 0.9528054296970367
+Average distance for animals_3: 0.9100473940372467
+Average distance for animals_4: 0.9415731489658355
+Average distance for animals_5: 0.9447858691215515
+Average distance for animals_6: 0.9757705926895142
+python resource/merge_images.py ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_test2 --prefix animals
+
+python resource/merge_images.py ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_test1 --prefix animals
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_test1 --prefix animals --mode clip_image
+benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_test1
+clip_image_total_avg_distance: 0.8774657142857145
+clip_text_total_avg_distance: 0.9156390476190478
+dreamsim_total_avg_distance: 0.2571328571428571
+
+benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2
+python resource/merge_images.py ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2 --prefix animals
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2 --prefix animals --mode clip_image
+clip_image_total_avg_distance: 0.9146190476190477
+clip_text_total_avg_distance: 0.8901838095238096
+dreamsim_total_avg_distance: 0.18439476190476192
+
+benchmark_consistory+kv_concat_0.2rate_upblock_0-20step
+python resource/merge_images.py ./result/benchmark_consistory+kv_concat_0.2rate_upblock_0-20step --prefix animals
+
+
+python resource/test_benchmark.py  --folder ./result/benchmark_consistory+id_replacement+new_subject_test1 --prefix fantasy --mode clip_image
+clip_image_total_avg_distance: 0.9469781818181818
+clip_text_total_avg_distance: 0.8788881818181818
+dreamsim_total_avg_distance: 0.13063136363636363
+clip_text_total_avg_distance: 0.9273579687500004 new_subject
+
+foods
+clip_image_total_avg_distance: 0.9383499999999998
+clip_text_total_avg_distance: 0.9043884999999999
+dreamsim_total_avg_distance: 0.131206
+clip_text_total_avg_distance: 0.9137094999999998
+
+humans
+clip_image_total_avg_distance: 0.8830314285714286
+dreamsim_total_avg_distance: 0.20760761904761907
+
+inanimate
+clip_image_total_avg_distance: 0.8631361111111112
+dreamsim_total_avg_distance: 0.2705022222222222
+
+nature
+clip_image_total_avg_distance: 0.9428429268292683
+dreamsim_total_avg_distance: 0.14558634146341465
+
+technoledge
+clip_image_total_avg_distance: 0.9393044444444444
+dreamsim_total_avg_distance: 0.13029666666666667
+
+//result
+all
+clip_text_total_avg_distance: 0.9025009523809522
+clip_image_total_avg_distance: 0.9200624479166666
+dreamsim_total_avg_distance: 0.17596557291666667
+
+//+prompt optimization
+python resource/merge_images.py ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2
+python resource/test_benchmark.py --mode clip_text --folder ./result/benchmark_consistory+id_replacement_0-50step_down+mid+upblock_no-ipca_no-svr_diff_prompt_+new_subject_test2 --mode clip_image
+clip_text_total_avg_distance: 0.900925453125
+clip_image_total_avg_distance: 0.9022088020833333
+dreamsim_total_avg_distance: 0.23115895833333342
+
+codi_benchmark
+python resource/test_benchmark.py --mode clip_text --folder ./result/codi_benchmark --prefix animals --mode clip_image
+clip_image_total_avg_distance: 0.8944990476190477
+dreamsim_total_avg_distance: 0.20303666666666667
+clip_text_total_avg_distance: 0.9074995238095239
+
+//+ Identity Replacement
+python resource/test_benchmark.py  --folder ./result/benchmark_consistory+id_replacement_only --mode dreamsim
+clip_text_total_avg_distance: 0.8990899479166669
+clip_image_total_avg_distance: 0.8859645833333332
+dreamsim_total_avg_distance: 0.25272598958333353
